@@ -22,8 +22,9 @@ async function getTenantToken(cfg: AppConfig): Promise<string> {
 }
 
 /**
- * 上传图片到审批附件存储，返回可用于「图片」控件的 url。失败返回 null（不阻断报销创建）。
+ * 上传图片到审批附件存储，返回可用于「图片」控件的文件 code。失败返回 null（不阻断报销创建）。
  * 接口：POST /approval/openapi/v2/file/upload （multipart: name/type/content）。
+ * 注意：图片控件的值必须是 code 字符串数组（传 url 会被静默丢弃、图片不显示）。
  */
 export async function uploadApprovalImage(
   cfg: AppConfig,
@@ -42,11 +43,11 @@ export async function uploadApprovalImage(
       body: fd,
     });
     const d: any = await r.json();
-    if (d?.code !== 0 || !d?.data?.url) {
+    if (d?.code !== 0 || !d?.data?.code) {
       logger.warn(`审批图片上传失败：${JSON.stringify(d).slice(0, 200)}`);
       return null;
     }
-    return d.data.url as string;
+    return d.data.code as string;
   } catch (e) {
     logger.warn('审批图片上传异常：', (e as Error).message);
     return null;

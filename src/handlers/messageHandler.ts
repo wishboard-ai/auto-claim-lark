@@ -60,15 +60,15 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       overrides.contents = gen.contents;
       logger.info(`LLM 生成标题：${gen.title}`);
     }
-    // 上传发票原图，收集 url 填入「图片」控件（失败不阻断）
-    const imageUrls: string[] = [];
+    // 上传发票原图，收集文件 code 填入「图片」控件（失败不阻断）
+    const imageCodes: string[] = [];
     for (const it of items) {
       if (it.imageBuffer) {
-        const url = await uploadApprovalImage(cfg, it.imageBuffer, `invoice.${it.imageExt || 'jpg'}`);
-        if (url) imageUrls.push(url);
+        const code = await uploadApprovalImage(cfg, it.imageBuffer, `invoice.${it.imageExt || 'jpg'}`);
+        if (code) imageCodes.push(code);
       }
     }
-    const { form, title } = buildApprovalForm(invoices, overrides, imageUrls);
+    const { form, title } = buildApprovalForm(invoices, overrides, imageCodes);
     if (form.length === 0) {
       await sendText(
         chatId,

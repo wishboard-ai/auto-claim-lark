@@ -133,7 +133,7 @@ function isPlaceholder(widgetId?: string): boolean {
 export function buildApprovalForm(
   invoices: RecognizedInvoice[],
   overrides: FormOverrides = {},
-  imageUrls: string[] = []
+  imageCodes: string[] = []
 ): { form: FormField[]; title: string } {
   const cfg = loadMapping();
   const form: FormField[] = [];
@@ -174,9 +174,9 @@ export function buildApprovalForm(
     }
   }
 
-  // 图片控件：填入发票原图 url 数组
-  if (cfg.imageField && !isPlaceholder(cfg.imageField.widgetId) && imageUrls.length > 0) {
-    form.push({ id: cfg.imageField.widgetId, type: cfg.imageField.widgetType, value: imageUrls });
+  // 图片控件：填入发票原图文件 code 数组（必须是 code，不能是 url）
+  if (cfg.imageField && !isPlaceholder(cfg.imageField.widgetId) && imageCodes.length > 0) {
+    form.push({ id: cfg.imageField.widgetId, type: cfg.imageField.widgetType, value: imageCodes });
   }
 
   // 合计金额控件：填入所有发票金额之和（条件分流依据此字段，必须填，否则默认走高限额分支）
