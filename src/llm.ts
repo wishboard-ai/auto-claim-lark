@@ -4,8 +4,7 @@ import { logger } from './logger';
 
 export interface GeneratedContent {
   title: string;
-  reason: string;
-  /** 每张发票对应的明细「内容」，顺序与传入发票一致 */
+  /** 每张发票对应的明细「内容」，顺序与传入发票一致（仅整理已有信息，不编造） */
   contents: string[];
 }
 
@@ -28,8 +27,8 @@ function extractJson(text: string): any | null {
 }
 
 /**
- * 用 LLM 生成报销标题 / 事由 / 每张发票的明细内容。
- * 未启用（无 API Key）或调用失败时返回 null，调用方回退到模板生成。
+ * 用 LLM 生成报销标题，并「整理」每张发票的明细内容（不生成事由，事由由员工输入）。
+ * 严格要求只基于发票已有信息整理，不得编造用途。未启用或失败时返回 null，回退模板。
  */
 export async function generateContent(
   cfg: AppConfig,
@@ -48,14 +47,13 @@ export async function generateContent(
   }));
 
   const system =
-    '你是企业费用报销助手。根据发票信息生成简洁、正式、符合中文财务习惯的报销单文案。只返回严格的 JSON，不要输出任何解释或额外文字。';
+    '你是企业费用报销助手，负责整理发票信息为规范的报销单文案。严禁编造任何发票中不存在的信息（尤其是用途、事由），只能基于给定字段进行归纳和格式化。只返回严格的 JSON，不要输出解释或额外文字。';
   const user =
     `发票列表（共 ${invoices.length} 张）：\n${JSON.stringify(items, null, 2)}\n\n` +
-    `请返回 JSON，字段：\n` +
-    `- "title": 报销单标题，不超过 20 字；\n` +
-    `- "reason": 报销事由，1-2 句话说明用途与合理性；\n` +
-    `- "contents": 字符串数组，长度必须等于发票数量(${invoices.length})，与发票顺序一一对应，每项是该发票的明细内容（商家+用途，简明）。\n` +
-    `示例：{"title":"...","reason":"...","contents":["...","..."]}`;
+    `请返回 JSON：\n` +
+    `- "title": 报销单标题，不超过 20 字，概括票据类型与商家，不要编造用途；\n` +
+    `- "contents": 字符串数组，长度必须等于 ${invoices.length}，与发票顺序一一对应；每项仅根据该发票已有信息（类型/商家/日期/金额）整理成简洁明细，不要编造用途或事由。\n` +
+    `示例：{"title":"通讯费报销(2张)","contents":["中国移动 2024-02 话费 ¥450.24","出租车 2024-01-15 ¥35.00"]}`;
 
   try {
     const resp = await fetch(`${cfg.llm.baseUrl.replace(/\/$/, '')}/chat/completions`, {
@@ -70,7 +68,7 @@ export async function generateContent(
           { role: 'system', content: system },
           { role: 'user', content: user },
         ],
-        temperature: 0.3,
+        temperature: 0.2,
       }),
     });
     if (!resp.ok) {
@@ -88,7 +86,6 @@ export async function generateContent(
     const contents = Array.isArray(parsed.contents) ? parsed.contents.map((x: any) => String(x)) : [];
     return {
       title: (String(parsed.title || '').trim() || '费用报销').slice(0, 40),
-      reason: String(parsed.reason || '').trim(),
       contents,
     };
   } catch (e) {

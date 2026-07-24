@@ -15,7 +15,7 @@ const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '
 const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
 
 const HELP_TEXT =
-  '你好，我是发票报销助手 🧾\n发送发票图片（增值税发票 / 火车票 / 出租车票），可连续发送多张累加到同一张报销单；\n发完后回复 **确认** 生成并提交费用报销，或回复 **取消** 放弃。';
+  '你好，我是发票报销助手 🧾\n发送发票图片（增值税发票 / 火车票 / 出租车票），可连续发送多张累加到同一张报销单；\n发完后直接回复本次「报销事由」即可提交（例如：1月客户拜访交通费），或回复「取消」放弃。';
 
 export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   // 幂等去重
@@ -49,13 +49,15 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   async function createFromItems(
     chatId: string,
     openId: string,
-    items: CartItem[]
+    items: CartItem[],
+    reason: string
   ): Promise<void> {
     const invoices = items.map((i) => i.invoice);
-    let overrides: FormOverrides = {};
+    const overrides: FormOverrides = { reason };
     const gen = await generateContent(cfg, invoices);
     if (gen) {
-      overrides = { title: gen.title, reason: gen.reason, contents: gen.contents };
+      overrides.title = gen.title;
+      overrides.contents = gen.contents;
       logger.info(`LLM 生成标题：${gen.title}`);
     }
     // 上传发票原图，收集 url 填入「图片」控件（失败不阻断）
@@ -109,7 +111,7 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     }
     const item: CartItem = { invoice, imageBuffer: buffer, imageExt: imgExt(buffer) };
     if (cfg.submitMode === 'direct') {
-      await createFromItems(chatId, openId, [item]);
+      await createFromItems(chatId, openId, [item], '');
     } else {
       const claim = addItem(openId, item);
       await sendCard(chatId, addedCard(claim.items.map((i) => i.invoice)));
@@ -121,22 +123,27 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     openId: string | undefined,
     content: string
   ): Promise<void> {
-    const text = String(JSON.parse(content).text || '').trim().toLowerCase();
-    if (openId && CONFIRM_WORDS.includes(text)) {
-      const pending = getPending(openId);
-      if (!pending || pending.items.length === 0) {
-        await sendText(chatId, '没有待提交的报销。请先发送发票图片。');
-        return;
-      }
-      const items = pending.items;
-      clearPending(openId);
-      await createFromItems(chatId, openId, items);
-    } else if (openId && CANCEL_WORDS.includes(text)) {
+    const raw = String(JSON.parse(content).text ?? '').trim();
+    const lower = raw.toLowerCase();
+
+    if (openId && CANCEL_WORDS.includes(lower)) {
       clearPending(openId);
       await sendText(chatId, '已取消本次报销。');
-    } else {
-      await sendText(chatId, HELP_TEXT);
+      return;
     }
+    const pending = openId ? getPending(openId) : undefined;
+    if (!openId || !pending || pending.items.length === 0) {
+      await sendText(chatId, HELP_TEXT);
+      return;
+    }
+    if (CONFIRM_WORDS.includes(lower) || raw === '') {
+      await sendText(chatId, '请直接回复本次报销的事由（例如：1月客户拜访交通费），我将据此创建并提交报销单。');
+      return;
+    }
+    // 用户输入的文本即为报销事由
+    const items = pending.items;
+    clearPending(openId);
+    await createFromItems(chatId, openId, items, raw);
   }
 
   async function onChatEntered(event: any): Promise<void> {

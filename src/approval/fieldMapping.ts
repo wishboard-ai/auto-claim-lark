@@ -29,6 +29,8 @@ interface MappingConfig {
   fieldList?: FieldListSpec;
   /** 图片控件：把发票原图 url 填入此控件 */
   imageField?: { widgetId: string; widgetType: string };
+  /** 合计金额控件（如费用汇总 formula）：填入所有发票金额之和，供条件分流判断 */
+  sumField?: { widgetId: string; widgetType: string };
 }
 
 /** LLM/外部生成的覆盖值 */
@@ -175,6 +177,12 @@ export function buildApprovalForm(
   // 图片控件：填入发票原图 url 数组
   if (cfg.imageField && !isPlaceholder(cfg.imageField.widgetId) && imageUrls.length > 0) {
     form.push({ id: cfg.imageField.widgetId, type: cfg.imageField.widgetType, value: imageUrls });
+  }
+
+  // 合计金额控件：填入所有发票金额之和（条件分流依据此字段，必须填，否则默认走高限额分支）
+  if (cfg.sumField && !isPlaceholder(cfg.sumField.widgetId)) {
+    const total = invoices.reduce((s, v) => s + (parseFloat((v.amount || '0').replace(/[^\d.-]/g, '')) || 0), 0);
+    form.push({ id: cfg.sumField.widgetId, type: cfg.sumField.widgetType, value: total.toFixed(2) });
   }
 
   const fallback = `费用报销-${aggLabel}`;

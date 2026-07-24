@@ -41,5 +41,6 @@
       { "widgetId": "widget16510510254730001", "widgetType": "amount", "source": "amount" }
     ]
   },
-  "imageField": { "widgetId": "widget17742629612200001", "widgetType": "image" }
+  "imageField": { "widgetId": "widget17742629612200001", "widgetType": "image" },
+  "sumField": { "widgetId": "widget16510509818090001", "widgetType": "formula" }
 }

@@ -40,7 +40,7 @@ export function addedCard(invoices: RecognizedInvoice[]): string {
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: list } },
       { tag: 'hr' },
-      { tag: 'div', text: { tag: 'lark_md', content: '继续发送发票图片可累加；回复 **确认** 提交，或 **取消** 放弃。' } },
+      { tag: 'div', text: { tag: 'lark_md', content: '继续发送发票图片可累加；回复本次「报销事由」即可提交（如：1月客户拜访交通费），或回复「取消」放弃。' } },
     ],
   });
 }
