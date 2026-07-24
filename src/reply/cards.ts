@@ -4,7 +4,7 @@ function line(label: string, value?: string): string | null {
   return value ? `**${label}**：${value}` : null;
 }
 
-/** 将识别结果渲染成多行 Markdown */
+/** 单张发票的多行明细（用于识别结果展示） */
 export function buildRecognitionLines(inv: RecognizedInvoice): string {
   return [
     line('票据类型', inv.typeLabel),
@@ -19,41 +19,48 @@ export function buildRecognitionLines(inv: RecognizedInvoice): string {
     .join('\n');
 }
 
-/** 待确认卡片（confirm 模式）：展示识别结果并提示回复确认/取消 */
-export function confirmCard(inv: RecognizedInvoice): string {
+function totalAmount(invoices: RecognizedInvoice[]): string {
+  const sum = invoices.reduce((s, v) => s + (parseFloat(v.amount || '0') || 0), 0);
+  return sum.toFixed(2);
+}
+
+function briefLine(inv: RecognizedInvoice, idx: number): string {
+  return `${idx}. ${inv.typeLabel}　¥${inv.amount ?? '-'}　${inv.date ?? ''}　${inv.sellerName ?? ''}`.trim();
+}
+
+/** 发票加入购物车后的卡片（含累计） */
+export function addedCard(invoices: RecognizedInvoice[]): string {
+  const list = invoices.map((v, i) => briefLine(v, i + 1)).join('\n');
   return JSON.stringify({
     config: { wide_screen_mode: true },
-    header: { template: 'orange', title: { tag: 'plain_text', content: '请确认报销信息' } },
+    header: {
+      template: 'blue',
+      title: { tag: 'plain_text', content: `已加入报销（共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}）` },
+    },
     elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: buildRecognitionLines(inv) } },
+      { tag: 'div', text: { tag: 'lark_md', content: list } },
       { tag: 'hr' },
-      {
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: '确认无误请回复 **确认**（或「提交」），机器人将为你创建并提交该费用报销审批；放弃请回复 **取消**。',
-        },
-      },
+      { tag: 'div', text: { tag: 'lark_md', content: '继续发送发票图片可累加；回复 **确认** 提交，或 **取消** 放弃。' } },
     ],
   });
 }
 
-/** 成功卡片：审批已创建（已进入审批流），附查看链接 */
-export function successCard(inv: RecognizedInvoice, link?: string): string {
+/** 提交成功卡片 */
+export function successCard(invoices: RecognizedInvoice[], link: string | undefined, title: string): string {
+  const list = invoices.map((v, i) => briefLine(v, i + 1)).join('\n');
   const elements: Array<Record<string, unknown>> = [
-    { tag: 'div', text: { tag: 'lark_md', content: buildRecognitionLines(inv) } },
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: `**${title}**\n共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}\n\n${list}`,
+      },
+    },
   ];
   if (link) {
     elements.push({
       tag: 'action',
-      actions: [
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: '查看审批' },
-          type: 'primary',
-          url: link,
-        },
-      ],
+      actions: [{ tag: 'button', text: { tag: 'plain_text', content: '查看审批' }, type: 'primary', url: link }],
     });
   }
   return JSON.stringify({

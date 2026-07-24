@@ -28,14 +28,15 @@
     {
       "widgetId": "widget16510509704570001",
       "widgetType": "textarea",
-      "source": "{typeLabel}报销 {sellerName} {summary}"
+      "source": "{typeLabel}报销 {sellerName} {summary}",
+      "role": "reason"
     }
   ],
   "fieldList": {
     "widgetId": "widget16510509950440001",
     "widgetType": "fieldList",
     "rowFields": [
-      { "widgetId": "widget16510510048490001", "widgetType": "input", "source": "{typeLabel} {summary}" },
+      { "widgetId": "widget16510510048490001", "widgetType": "input", "source": "{typeLabel} {summary}", "role": "content" },
       { "widgetId": "widget16510510138590001", "widgetType": "date", "source": "date", "valueFormat": "datetime" },
       { "widgetId": "widget16510510254730001", "widgetType": "amount", "source": "amount" }
     ]

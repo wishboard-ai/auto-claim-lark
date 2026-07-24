@@ -4,26 +4,22 @@ import { RecognizedInvoice, FormField } from '../types';
 import { logger } from '../logger';
 
 type ValueFormat = 'string' | 'number' | 'date' | 'datetime';
+type FieldRole = 'reason' | 'content' | 'title';
 
 interface FieldSpec {
-  /** 审批表单控件 ID（通过 npm run inspect:approval 获取） */
   widgetId: string;
-  /** 控件类型：input | textarea | number | amount | date | radioV2 | ... */
   widgetType: string;
-  /** 取值来源：RecognizedInvoice 字段名 / raw 原始字段名 / 模板 "{sellerName}-{invoiceNo}" */
   source?: string;
-  /** 固定值（优先于 source）；如 radioV2 的选项 id */
   constValue?: string;
-  /** 按票种取值（优先于 constValue/source）；键为 vat|train|taxi */
   valueByType?: Record<string, string>;
-  /** 值格式化方式，缺省按控件类型推断 */
   valueFormat?: ValueFormat;
+  /** 语义角色：可被 LLM 生成结果覆盖（reason=事由, content=明细内容） */
+  role?: FieldRole;
 }
 
-/** 明细控件组（fieldList），每张发票生成一行 */
 interface FieldListSpec {
   widgetId: string;
-  widgetType: string; // 通常为 fieldList
+  widgetType: string;
   rowFields: FieldSpec[];
 }
 
@@ -31,6 +27,13 @@ interface MappingConfig {
   title?: string;
   fields: FieldSpec[];
   fieldList?: FieldListSpec;
+}
+
+/** LLM/外部生成的覆盖值 */
+export interface FormOverrides {
+  title?: string;
+  reason?: string;
+  contents?: string[]; // 与 invoices 顺序一致，每张发票的明细内容
 }
 
 const MAPPING_PATH =
@@ -65,11 +68,8 @@ function pick(invoice: RecognizedInvoice, source: string): string | undefined {
   return direct != null ? String(direct) : undefined;
 }
 
-/** 解析出格式化前的原始取值：valueByType > constValue > source */
 function resolveRaw(spec: FieldSpec, invoice: RecognizedInvoice): string | undefined {
-  if (spec.valueByType && spec.valueByType[invoice.type] != null) {
-    return spec.valueByType[invoice.type];
-  }
+  if (spec.valueByType && spec.valueByType[invoice.type] != null) return spec.valueByType[invoice.type];
   if (spec.constValue != null) return spec.constValue;
   if (spec.source) return pick(invoice, spec.source);
   return undefined;
@@ -93,17 +93,15 @@ function toIsoDate(v: string): string {
   return m ? `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}` : v;
 }
 
-function formatValue(spec: FieldSpec, invoice: RecognizedInvoice): unknown {
-  const rawVal = resolveRaw(spec, invoice);
-  if (rawVal == null || rawVal === '') return undefined;
+function applyFormat(spec: FieldSpec, rawVal: string): unknown {
   const fmt = spec.valueFormat || defaultFormat(spec.widgetType);
   switch (fmt) {
     case 'number': {
       const cleaned = rawVal.replace(/[^\d.-]/g, '');
-      return cleaned === '' ? undefined : cleaned; // 数值/金额控件的值以字符串传入
+      return cleaned === '' ? undefined : cleaned;
     }
     case 'date':
-      return toIsoDate(rawVal); // YYYY-MM-DD
+      return toIsoDate(rawVal);
     case 'datetime': {
       const d = toIsoDate(rawVal);
       return /^\d{4}-\d{2}-\d{2}$/.test(d) ? `${d}T00:00:00+08:00` : rawVal;
@@ -113,44 +111,71 @@ function formatValue(spec: FieldSpec, invoice: RecognizedInvoice): unknown {
   }
 }
 
+function formatValue(spec: FieldSpec, invoice: RecognizedInvoice): unknown {
+  const rawVal = resolveRaw(spec, invoice);
+  if (rawVal == null || rawVal === '') return undefined;
+  return applyFormat(spec, rawVal);
+}
+
 function isPlaceholder(widgetId?: string): boolean {
   return !widgetId || widgetId.startsWith('REPLACE_');
 }
 
-/** 根据配置将识别结果映射为审批表单字段数组与标题 */
-export function buildApprovalForm(invoice: RecognizedInvoice): { form: FormField[]; title: string } {
+/**
+ * 将一张或多张发票映射为审批表单。
+ * - 顶层字段（报销类型/事由）基于聚合信息；role=reason 可被 overrides.reason 覆盖。
+ * - fieldList 每张发票生成一行；role=content 可被 overrides.contents[i] 覆盖。
+ */
+export function buildApprovalForm(
+  invoices: RecognizedInvoice[],
+  overrides: FormOverrides = {}
+): { form: FormField[]; title: string } {
   const cfg = loadMapping();
   const form: FormField[] = [];
+  const primary = invoices[0];
+  const allSame = invoices.every((v) => v.type === primary.type);
+  const aggType = allSame ? primary.type : 'unknown';
+  const aggLabel = allSame ? primary.typeLabel : `${invoices.length}张发票`;
+  const aggInvoice: RecognizedInvoice = { ...primary, type: aggType, typeLabel: aggLabel };
 
   for (const spec of cfg.fields) {
     if (isPlaceholder(spec.widgetId)) {
-      logger.warn(`字段映射未配置 widgetId（source=${spec.source ?? spec.widgetType}），已跳过`);
+      logger.warn(`字段映射未配置 widgetId（${spec.role ?? spec.widgetType}），已跳过`);
       continue;
     }
-    const value = formatValue(spec, invoice);
-    if (value === undefined) continue;
+    let value: unknown;
+    if (spec.role === 'reason' && overrides.reason) value = overrides.reason;
+    else value = formatValue(spec, aggInvoice);
+    if (value === undefined || value === '') continue;
     form.push({ id: spec.widgetId, type: spec.widgetType, value });
   }
 
-  // 明细控件组：生成单行
   if (cfg.fieldList && !isPlaceholder(cfg.fieldList.widgetId)) {
-    const row: FormField[] = [];
-    for (const rf of cfg.fieldList.rowFields) {
-      if (isPlaceholder(rf.widgetId)) continue;
-      const v = formatValue(rf, invoice);
-      if (v === undefined) continue;
-      row.push({ id: rf.widgetId, type: rf.widgetType, value: v });
-    }
-    if (row.length > 0) {
-      form.push({ id: cfg.fieldList.widgetId, type: cfg.fieldList.widgetType, value: [row] });
+    const rows: FormField[][] = [];
+    invoices.forEach((inv, i) => {
+      const row: FormField[] = [];
+      for (const rf of cfg.fieldList!.rowFields) {
+        if (isPlaceholder(rf.widgetId)) continue;
+        let v: unknown;
+        if (rf.role === 'content' && overrides.contents?.[i]) v = overrides.contents[i];
+        else v = formatValue(rf, inv);
+        if (v === undefined || v === '') continue;
+        row.push({ id: rf.widgetId, type: rf.widgetType, value: v });
+      }
+      if (row.length > 0) rows.push(row);
+    });
+    if (rows.length > 0) {
+      form.push({ id: cfg.fieldList.widgetId, type: cfg.fieldList.widgetType, value: rows });
     }
   }
 
-  const fallback = `费用报销-${invoice.typeLabel}`;
-  const title = cfg.title
-    ? cfg.title.includes('{')
-      ? renderTemplate(cfg.title, invoice) || fallback
-      : cfg.title
-    : fallback;
+  const fallback = `费用报销-${aggLabel}`;
+  const title = overrides.title
+    ? overrides.title
+    : cfg.title
+      ? cfg.title.includes('{')
+        ? renderTemplate(cfg.title, aggInvoice) || fallback
+        : cfg.title
+      : fallback;
   return { form, title };
 }

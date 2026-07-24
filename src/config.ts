@@ -39,10 +39,19 @@ export interface Credentials {
   logLevel: string;
 }
 
+/** 可选的 LLM 配置（OpenAI 兼容接口）。未配置 apiKey 时禁用，回退到模板生成。 */
+export interface LlmConfig {
+  enabled: boolean;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
 /** 机器人完整运行配置 */
 export interface AppConfig extends Credentials {
   approvalCode: string;
   submitMode: SubmitMode;
+  llm: LlmConfig;
 }
 
 export function loadCredentials(): Credentials {
@@ -58,9 +67,17 @@ export function loadConfig(): AppConfig {
   const creds = loadCredentials();
   const submitMode: SubmitMode =
     opt('SUBMIT_MODE', 'confirm').toLowerCase() === 'direct' ? 'direct' : 'confirm';
+  const apiKey = opt('LLM_API_KEY', '');
+  const llm: LlmConfig = {
+    enabled: !!apiKey,
+    baseUrl: opt('LLM_BASE_URL', 'https://api.openai.com/v1'),
+    apiKey,
+    model: opt('LLM_MODEL', 'gpt-4o-mini'),
+  };
   return {
     ...creds,
     approvalCode: req('APPROVAL_CODE'),
     submitMode,
+    llm,
   };
 }
