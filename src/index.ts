@@ -10,11 +10,14 @@ async function main(): Promise<void> {
 
   const client = createClient(cfg);
   const wsClient = createWSClient(cfg);
-  const onMessage = makeMessageHandler(client, cfg);
+  const { onMessage, onChatEntered } = makeMessageHandler(client, cfg);
 
   const eventDispatcher = new lark.EventDispatcher({}).register({
     'im.message.receive_v1': async (data) => {
       await onMessage(data);
+    },
+    'im.chat.access_event.bot_p2p_chat_entered_v1': async (data) => {
+      await onChatEntered(data);
     },
   });
 

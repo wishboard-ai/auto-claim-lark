@@ -123,7 +123,25 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     }
   }
 
-  return async function onMessage(event: any): Promise<void> {
+  // 用户进入与机器人的单聊会话时发送欢迎语（节流，避免频繁进入刷屏）
+  const welcomed = new Map<string, number>();
+  const WELCOME_TTL_MS = 30 * 60 * 1000;
+
+  async function onChatEntered(event: any): Promise<void> {
+    const chatId: string | undefined = event?.chat_id;
+    if (!chatId) return;
+    const now = Date.now();
+    const last = welcomed.get(chatId);
+    if (last && now - last < WELCOME_TTL_MS) return;
+    welcomed.set(chatId, now);
+    try {
+      await sendText(chatId, HELP_TEXT);
+    } catch (e) {
+      logger.warn('发送欢迎语失败：', (e as Error).message);
+    }
+  }
+
+  async function onMessage(event: any): Promise<void> {
     const message = event?.message;
     const openId: string | undefined = event?.sender?.sender_id?.open_id;
     const chatId: string | undefined = message?.chat_id;
@@ -151,5 +169,7 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
         /* 忽略二次失败 */
       }
     }
-  };
+  }
+
+  return { onMessage, onChatEntered };
 }
