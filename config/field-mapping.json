@@ -1,11 +1,43 @@
 {
-  "_comment": "将识别到的发票字段映射到费用报销审批表单控件。运行 `npm run inspect:approval -- <approval_code>` 获取 widgetId 与类型，替换下面的 REPLACE_ 占位符。source 可用字段：amount/date/sellerName/buyerName/invoiceNo/taxAmount/summary/typeLabel，或 raw 中的原始字段名；也支持模板如 \"{sellerName}-{invoiceNo}\"。widgetType 需与审批控件类型一致（input/textarea/number/amount/date 等）。",
+  "_comment": "费用报销审批(08835DC3-456D-4EC8-BC60-D4433588821C)的字段映射。金额/日期/内容在 fieldList「费用明细」内。报销类型(radioV2)按票种选择选项id，可按需调整。费用汇总为 formula 自动计算，勿填。",
+  "_radioV2_options": {
+    "交通费": "l2hd3cj7-usyt3p18f3n-2",
+    "差旅费": "l2hd3cj7-ic8oib4joe9-0",
+    "业务招待费": "l2hd3cj7-whi7ved3my-3",
+    "员工福利费": "l2hd3cj7-1oyfvnuc74-1",
+    "快递物流费": "l2hd3cj7-4evardbdloj-4",
+    "办公相关的采购": "mn32bev6-v3jeifwnum-0",
+    "业务相关的采购": "mn32bev6-5bns6zsxh6-1",
+    "加班餐补": "mn32bev6-rf0oqrnwha-2",
+    "销售费用": "mn32bev6-mx9bufxbeu-3",
+    "其他": "mn32bev6-0uosbm6tkvz-4",
+    "备用金账户报销": "mrebu8eh-63uznel5p24-1"
+  },
   "title": "费用报销-{typeLabel}",
   "fields": [
-    { "widgetId": "REPLACE_金额控件ID", "widgetType": "amount", "source": "amount" },
-    { "widgetId": "REPLACE_日期控件ID", "widgetType": "date", "source": "date" },
-    { "widgetId": "REPLACE_商家控件ID", "widgetType": "input", "source": "sellerName" },
-    { "widgetId": "REPLACE_发票号控件ID", "widgetType": "input", "source": "invoiceNo" },
-    { "widgetId": "REPLACE_事由控件ID", "widgetType": "textarea", "source": "summary" }
-  ]
+    {
+      "widgetId": "widget16510509268920001",
+      "widgetType": "radioV2",
+      "constValue": "mn32bev6-0uosbm6tkvz-4",
+      "valueByType": {
+        "taxi": "l2hd3cj7-usyt3p18f3n-2",
+        "train": "l2hd3cj7-usyt3p18f3n-2",
+        "vat": "mn32bev6-0uosbm6tkvz-4"
+      }
+    },
+    {
+      "widgetId": "widget16510509704570001",
+      "widgetType": "textarea",
+      "source": "{typeLabel}报销 {sellerName} {summary}"
+    }
+  ],
+  "fieldList": {
+    "widgetId": "widget16510509950440001",
+    "widgetType": "fieldList",
+    "rowFields": [
+      { "widgetId": "widget16510510048490001", "widgetType": "input", "source": "{typeLabel} {summary}" },
+      { "widgetId": "widget16510510138590001", "widgetType": "date", "source": "date", "valueFormat": "date" },
+      { "widgetId": "widget16510510254730001", "widgetType": "amount", "source": "amount" }
+    ]
+  }
 }

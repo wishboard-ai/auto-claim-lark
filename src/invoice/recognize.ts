@@ -6,12 +6,18 @@ import { InvoiceType, RecognizedInvoice } from '../types';
 import { logger } from '../logger';
 
 type Entity = { type?: string; value?: string };
+type SpecificType = Exclude<InvoiceType, 'unknown'>;
+
+export interface Candidate {
+  invoice: RecognizedInvoice;
+  score: number;
+}
 
 function entitiesToMap(entities?: Entity[]): Record<string, string> {
   const map: Record<string, string> = {};
   for (const e of entities ?? []) {
-    if (e.type && e.value != null && map[e.type] === undefined) {
-      map[e.type] = e.value;
+    if (e.type && e.value != null && String(e.value).trim() !== '' && map[e.type] === undefined) {
+      map[e.type] = String(e.value).trim();
     }
   }
   return map;
@@ -32,7 +38,128 @@ function normDate(v?: string): string | undefined {
   return v;
 }
 
-/** 由图片魔数推断扩展名（飞书 OCR 需要带文件名/扩展名的 multipart 文件） */
+/**
+ * 各票种的「特征字段」权重。
+ * 关键在于：taxi/train 拥有增值税发票绝不会有的身份字段（车号、里程、车次、站点），
+ * 给它们高权重，使其在同一图片上稳压增值税识别器的通用字段（发票号/代码）。
+ */
+const WEIGHTS: Record<SpecificType, Record<string, number>> = {
+  taxi: {
+    car_number: 4,
+    distance: 3,
+    dispatch_fee: 2,
+    additional_fee: 1,
+    start_time: 1,
+    end_time: 1,
+    total_amount: 1,
+    invoice_no: 0.5,
+  },
+  train: {
+    train_num: 4,
+    start_station: 2,
+    end_station: 2,
+    seat_num: 1,
+    seat_cls: 1,
+    ticket_num: 1,
+    total_amount: 1,
+  },
+  vat: {
+    seller_taxpayer_no: 2,
+    buyer_taxpayer_no: 2,
+    total_tax: 2,
+    invoice_special_seal: 1,
+    total_price_and_tax: 1,
+    invoice_no: 0.5,
+    invoice_code: 0.5,
+  },
+};
+
+function scoreOf(raw: Record<string, string>, weights: Record<string, number>): number {
+  let s = 0;
+  for (const [k, w] of Object.entries(weights)) if (raw[k]) s += w;
+  return s;
+}
+
+/** 由原始字段构造候选（纯函数，便于单测分类逻辑）。score<=0 视为未命中。 */
+export function buildCandidate(type: SpecificType, raw: Record<string, string>): Candidate | null {
+  const score = scoreOf(raw, WEIGHTS[type]);
+  if (score <= 0) return null;
+
+  let invoice: RecognizedInvoice;
+  if (type === 'taxi') {
+    const timeRange = raw.start_time
+      ? `${raw.start_time}${raw.end_time ? '-' + raw.end_time : ''}`
+      : '';
+    invoice = {
+      type: 'taxi',
+      typeLabel: '出租车票',
+      amount: normAmount(raw.total_amount || raw.price),
+      date: normDate(raw.start_date),
+      sellerName: '出租车',
+      invoiceNo: raw.invoice_no,
+      summary: [timeRange, raw.distance ? `${raw.distance}km` : ''].filter(Boolean).join(' ') || undefined,
+      raw,
+    };
+  } else if (type === 'train') {
+    const route = [raw.start_station, raw.end_station].filter(Boolean).join(' → ');
+    invoice = {
+      type: 'train',
+      typeLabel: '火车票',
+      amount: normAmount(raw.total_amount || raw.price),
+      date: normDate(raw.time),
+      sellerName: '中国铁路',
+      invoiceNo: raw.ticket_num,
+      summary: [route, raw.train_num, raw.seat_cls].filter(Boolean).join(' ') || undefined,
+      raw,
+    };
+  } else {
+    invoice = {
+      type: 'vat',
+      typeLabel: raw.invoice_name || '增值税发票',
+      amount: normAmount(raw.total_price_and_tax || raw.total_price),
+      date: normDate(raw.invoice_date),
+      sellerName: raw.seller_name,
+      buyerName: raw.buyer_name,
+      invoiceNo: raw.invoice_no,
+      taxAmount: normAmount(raw.total_tax),
+      summary: raw.remarks || undefined,
+      raw,
+    };
+  }
+  return { invoice, score };
+}
+
+/** 从候选中选出得分最高者；特征更强的票种胜出。无候选则未知票据。 */
+export function selectBest(candidates: Array<Candidate | null>): RecognizedInvoice {
+  const valid = candidates.filter((c): c is Candidate => !!c);
+  if (valid.length === 0) return { type: 'unknown', typeLabel: '未知票据', raw: {} };
+  valid.sort((a, b) => b.score - a.score);
+  logger.debug('识别候选得分：', valid.map((c) => `${c.invoice.type}=${c.score}`).join(', '));
+  return valid[0].invoice;
+}
+
+// 各票种调用飞书对应识别端点，返回原始字段 map（每次新建 ReadStream，流只能消费一次）。
+const EXTRACTORS: Record<SpecificType, (client: lark.Client, filePath: string) => Promise<Record<string, string>>> = {
+  vat: async (client, filePath) => {
+    const resp = (await client.document_ai.v1.vatInvoice.recognize({
+      data: { file: fs.createReadStream(filePath) },
+    })) as any;
+    return entitiesToMap(resp?.vat_invoices?.[0]?.entities ?? resp?.data?.vat_invoices?.[0]?.entities);
+  },
+  train: async (client, filePath) => {
+    const resp = (await client.document_ai.v1.trainInvoice.recognize({
+      data: { file: fs.createReadStream(filePath) },
+    })) as any;
+    return entitiesToMap(resp?.train_invoices?.[0]?.entities ?? resp?.data?.train_invoices?.[0]?.entities);
+  },
+  taxi: async (client, filePath) => {
+    const resp = (await client.document_ai.v1.taxiInvoice.recognize({
+      data: { file: fs.createReadStream(filePath) },
+    })) as any;
+    return entitiesToMap(resp?.taxi_invoices?.[0]?.entities ?? resp?.data?.taxi_invoices?.[0]?.entities);
+  },
+};
+
 function extForImage(buf: Buffer): string {
   if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
   if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
@@ -42,92 +169,16 @@ function extForImage(buf: Buffer): string {
   return 'jpg';
 }
 
-// 识别器接收图片临时文件路径；每次调用内部新建 ReadStream（流只能消费一次）。
-type Recognizer = (client: lark.Client, filePath: string) => Promise<RecognizedInvoice | null>;
-
-const recognizeVat: Recognizer = async (client, filePath) => {
-  const resp = (await client.document_ai.v1.vatInvoice.recognize({
-    data: { file: fs.createReadStream(filePath) },
-  })) as any;
-  const entities: Entity[] | undefined =
-    resp?.vat_invoices?.[0]?.entities ?? resp?.data?.vat_invoices?.[0]?.entities;
-  const raw = entitiesToMap(entities);
-  if (!raw.total_price_and_tax && !raw.invoice_no && !raw.invoice_code) return null;
-  return {
-    type: 'vat',
-    typeLabel: raw.invoice_name || '增值税发票',
-    amount: normAmount(raw.total_price_and_tax || raw.total_price),
-    date: normDate(raw.invoice_date),
-    sellerName: raw.seller_name,
-    buyerName: raw.buyer_name,
-    invoiceNo: raw.invoice_no,
-    taxAmount: normAmount(raw.total_tax),
-    summary: raw.remarks || undefined,
-    raw,
-  };
-};
-
-const recognizeTrain: Recognizer = async (client, filePath) => {
-  const resp = (await client.document_ai.v1.trainInvoice.recognize({
-    data: { file: fs.createReadStream(filePath) },
-  })) as any;
-  const entities: Entity[] | undefined =
-    resp?.train_invoices?.[0]?.entities ?? resp?.data?.train_invoices?.[0]?.entities;
-  const raw = entitiesToMap(entities);
-  if (!raw.total_amount && !raw.ticket_num && !raw.train_num) return null;
-  const route = [raw.start_station, raw.end_station].filter(Boolean).join(' → ');
-  return {
-    type: 'train',
-    typeLabel: '火车票',
-    amount: normAmount(raw.total_amount || raw.price),
-    date: normDate(raw.time),
-    sellerName: '中国铁路',
-    invoiceNo: raw.ticket_num,
-    summary: [route, raw.train_num, raw.seat_cls].filter(Boolean).join(' ') || undefined,
-    raw,
-  };
-};
-
-const recognizeTaxi: Recognizer = async (client, filePath) => {
-  const resp = (await client.document_ai.v1.taxiInvoice.recognize({
-    data: { file: fs.createReadStream(filePath) },
-  })) as any;
-  const entities: Entity[] | undefined =
-    resp?.taxi_invoices?.[0]?.entities ?? resp?.data?.taxi_invoices?.[0]?.entities;
-  const raw = entitiesToMap(entities);
-  if (!raw.total_amount && !raw.invoice_no) return null;
-  const timeRange = raw.start_time
-    ? `${raw.start_time}${raw.end_time ? '-' + raw.end_time : ''}`
-    : '';
-  return {
-    type: 'taxi',
-    typeLabel: '出租车票',
-    amount: normAmount(raw.total_amount || raw.price),
-    date: normDate(raw.start_date),
-    sellerName: '出租车',
-    invoiceNo: raw.invoice_no,
-    summary: [timeRange, raw.distance ? `${raw.distance}km` : ''].filter(Boolean).join(' ') || undefined,
-    raw,
-  };
-};
-
-const RECOGNIZERS: Record<Exclude<InvoiceType, 'unknown'>, Recognizer> = {
-  vat: recognizeVat,
-  train: recognizeTrain,
-  taxi: recognizeTaxi,
-};
-
-const DEFAULT_ORDER: Array<Exclude<InvoiceType, 'unknown'>> = ['vat', 'train', 'taxi'];
+const DEFAULT_ORDER: SpecificType[] = ['taxi', 'train', 'vat'];
 
 /**
- * 识别发票。飞书未提供统一票种分类接口，故按优先级顺序尝试各识别器，命中即返回。
- * 图片以临时文件 + ReadStream 传入（飞书 OCR 的 multipart 需要带文件名，否则返回
- * 400 Param is invalid）；每个识别器各自新建流，结束后清理临时文件。
+ * 识别发票：并行调用全部票种识别器，按特征字段打分选出最可能的票种。
+ * 图片以临时文件 + ReadStream 传入（飞书 OCR 的 multipart 需要文件名，否则 400）。
  */
 export async function recognizeInvoice(
   client: lark.Client,
   file: Buffer,
-  order: Array<Exclude<InvoiceType, 'unknown'>> = DEFAULT_ORDER
+  order: SpecificType[] = DEFAULT_ORDER
 ): Promise<RecognizedInvoice> {
   const ext = extForImage(file);
   const tmpPath = path.join(
@@ -136,18 +187,20 @@ export async function recognizeInvoice(
   );
   await fs.promises.writeFile(tmpPath, file);
   try {
-    for (const t of order) {
-      try {
-        const result = await RECOGNIZERS[t](client, tmpPath);
-        if (result) {
-          logger.info(`识别命中：${result.typeLabel}`);
-          return result;
+    const results = await Promise.all(
+      order.map(async (t) => {
+        try {
+          const raw = await EXTRACTORS[t](client, tmpPath);
+          return buildCandidate(t, raw);
+        } catch (e) {
+          logger.warn(`${t} 识别调用失败：`, (e as Error).message);
+          return null;
         }
-      } catch (e) {
-        logger.warn(`${t} 识别调用失败：`, (e as Error).message);
-      }
-    }
-    return { type: 'unknown', typeLabel: '未知票据', raw: {} };
+      })
+    );
+    const invoice = selectBest(results);
+    if (invoice.type !== 'unknown') logger.info(`识别命中：${invoice.typeLabel}`);
+    return invoice;
   } finally {
     fs.promises.unlink(tmpPath).catch(() => {});
   }
