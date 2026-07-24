@@ -36,7 +36,7 @@
     "widgetType": "fieldList",
     "rowFields": [
       { "widgetId": "widget16510510048490001", "widgetType": "input", "source": "{typeLabel} {summary}" },
-      { "widgetId": "widget16510510138590001", "widgetType": "date", "source": "date", "valueFormat": "date" },
+      { "widgetId": "widget16510510138590001", "widgetType": "date", "source": "date", "valueFormat": "datetime" },
       { "widgetId": "widget16510510254730001", "widgetType": "amount", "source": "amount" }
     ]
   }
