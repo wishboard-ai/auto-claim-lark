@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { InvoiceType, RecognizedInvoice } from '../types';
 import { logger } from '../logger';
@@ -29,10 +32,23 @@ function normDate(v?: string): string | undefined {
   return v;
 }
 
-type Recognizer = (client: lark.Client, file: Buffer) => Promise<RecognizedInvoice | null>;
+/** 由图片魔数推断扩展名（飞书 OCR 需要带文件名/扩展名的 multipart 文件） */
+function extForImage(buf: Buffer): string {
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'webp';
+  if (buf.length >= 3 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'gif';
+  if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp';
+  return 'jpg';
+}
 
-const recognizeVat: Recognizer = async (client, file) => {
-  const resp = (await client.document_ai.v1.vatInvoice.recognize({ data: { file } })) as any;
+// 识别器接收图片临时文件路径；每次调用内部新建 ReadStream（流只能消费一次）。
+type Recognizer = (client: lark.Client, filePath: string) => Promise<RecognizedInvoice | null>;
+
+const recognizeVat: Recognizer = async (client, filePath) => {
+  const resp = (await client.document_ai.v1.vatInvoice.recognize({
+    data: { file: fs.createReadStream(filePath) },
+  })) as any;
   const entities: Entity[] | undefined =
     resp?.vat_invoices?.[0]?.entities ?? resp?.data?.vat_invoices?.[0]?.entities;
   const raw = entitiesToMap(entities);
@@ -51,8 +67,10 @@ const recognizeVat: Recognizer = async (client, file) => {
   };
 };
 
-const recognizeTrain: Recognizer = async (client, file) => {
-  const resp = (await client.document_ai.v1.trainInvoice.recognize({ data: { file } })) as any;
+const recognizeTrain: Recognizer = async (client, filePath) => {
+  const resp = (await client.document_ai.v1.trainInvoice.recognize({
+    data: { file: fs.createReadStream(filePath) },
+  })) as any;
   const entities: Entity[] | undefined =
     resp?.train_invoices?.[0]?.entities ?? resp?.data?.train_invoices?.[0]?.entities;
   const raw = entitiesToMap(entities);
@@ -70,8 +88,10 @@ const recognizeTrain: Recognizer = async (client, file) => {
   };
 };
 
-const recognizeTaxi: Recognizer = async (client, file) => {
-  const resp = (await client.document_ai.v1.taxiInvoice.recognize({ data: { file } })) as any;
+const recognizeTaxi: Recognizer = async (client, filePath) => {
+  const resp = (await client.document_ai.v1.taxiInvoice.recognize({
+    data: { file: fs.createReadStream(filePath) },
+  })) as any;
   const entities: Entity[] | undefined =
     resp?.taxi_invoices?.[0]?.entities ?? resp?.data?.taxi_invoices?.[0]?.entities;
   const raw = entitiesToMap(entities);
@@ -100,24 +120,35 @@ const RECOGNIZERS: Record<Exclude<InvoiceType, 'unknown'>, Recognizer> = {
 const DEFAULT_ORDER: Array<Exclude<InvoiceType, 'unknown'>> = ['vat', 'train', 'taxi'];
 
 /**
- * 识别发票。飞书未提供统一的票种分类接口，故按优先级顺序尝试各识别器，
- * 命中（返回结构化字段）即返回，最多 3 次 API 调用。可通过 order 调整顺序或裁剪票种。
+ * 识别发票。飞书未提供统一票种分类接口，故按优先级顺序尝试各识别器，命中即返回。
+ * 图片以临时文件 + ReadStream 传入（飞书 OCR 的 multipart 需要带文件名，否则返回
+ * 400 Param is invalid）；每个识别器各自新建流，结束后清理临时文件。
  */
 export async function recognizeInvoice(
   client: lark.Client,
   file: Buffer,
   order: Array<Exclude<InvoiceType, 'unknown'>> = DEFAULT_ORDER
 ): Promise<RecognizedInvoice> {
-  for (const t of order) {
-    try {
-      const result = await RECOGNIZERS[t](client, file);
-      if (result) {
-        logger.info(`识别命中：${result.typeLabel}`);
-        return result;
+  const ext = extForImage(file);
+  const tmpPath = path.join(
+    os.tmpdir(),
+    `invoice_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`
+  );
+  await fs.promises.writeFile(tmpPath, file);
+  try {
+    for (const t of order) {
+      try {
+        const result = await RECOGNIZERS[t](client, tmpPath);
+        if (result) {
+          logger.info(`识别命中：${result.typeLabel}`);
+          return result;
+        }
+      } catch (e) {
+        logger.warn(`${t} 识别调用失败：`, (e as Error).message);
       }
-    } catch (e) {
-      logger.warn(`${t} 识别调用失败：`, (e as Error).message);
     }
+    return { type: 'unknown', typeLabel: '未知票据', raw: {} };
+  } finally {
+    fs.promises.unlink(tmpPath).catch(() => {});
   }
-  return { type: 'unknown', typeLabel: '未知票据', raw: {} };
 }
