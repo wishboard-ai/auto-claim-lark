@@ -20,7 +20,7 @@ const HELP_TEXT =
 export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   // 幂等去重
   const processed = new Map<string, number>();
-  const DEDUP_TTL_MS = 5 * 60 * 1000;
+  const DEDUP_TTL_MS = 60 * 60 * 1000;
   function seenBefore(messageId: string): boolean {
     const now = Date.now();
     for (const [k, t] of processed) if (now - t > DEDUP_TTL_MS) processed.delete(k);
@@ -172,22 +172,26 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       return;
     }
 
-    try {
-      if (msgType === 'image') {
-        await handleImage(chatId, openId, messageId, message.content);
-      } else if (msgType === 'text') {
-        await handleText(chatId, openId, message.content);
-      } else {
-        await sendText(chatId, '请发送发票图片（增值税发票 / 火车票 / 出租车票）。');
-      }
-    } catch (e) {
-      logger.error('处理消息出错', e);
+    // 立即返回以在 3 秒内完成 ack；下载/识别/上传/创建等重活放到后台执行，
+    // 避免长连接超时(>3s)重推、进而重复处理（如凭空冒出"已加入报销"）。
+    void (async () => {
       try {
-        await sendText(chatId, `处理失败：${(e as Error).message}`);
-      } catch {
-        /* 忽略二次失败 */
+        if (msgType === 'image') {
+          await handleImage(chatId, openId, messageId, message.content);
+        } else if (msgType === 'text') {
+          await handleText(chatId, openId, message.content);
+        } else {
+          await sendText(chatId, '请发送发票图片（增值税发票 / 火车票 / 出租车票）。');
+        }
+      } catch (e) {
+        logger.error('处理消息出错', e);
+        try {
+          await sendText(chatId, `处理失败：${(e as Error).message}`);
+        } catch {
+          /* 忽略二次失败 */
+        }
       }
-    }
+    })();
   }
 
   return { onMessage, onChatEntered };
