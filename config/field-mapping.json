@@ -40,5 +40,6 @@
       { "widgetId": "widget16510510138590001", "widgetType": "date", "source": "date", "valueFormat": "datetime" },
       { "widgetId": "widget16510510254730001", "widgetType": "amount", "source": "amount" }
     ]
-  }
+  },
+  "imageField": { "widgetId": "widget17742629612200001", "widgetType": "image" }
 }

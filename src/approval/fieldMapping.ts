@@ -27,6 +27,8 @@ interface MappingConfig {
   title?: string;
   fields: FieldSpec[];
   fieldList?: FieldListSpec;
+  /** 图片控件：把发票原图 url 填入此控件 */
+  imageField?: { widgetId: string; widgetType: string };
 }
 
 /** LLM/外部生成的覆盖值 */
@@ -128,7 +130,8 @@ function isPlaceholder(widgetId?: string): boolean {
  */
 export function buildApprovalForm(
   invoices: RecognizedInvoice[],
-  overrides: FormOverrides = {}
+  overrides: FormOverrides = {},
+  imageUrls: string[] = []
 ): { form: FormField[]; title: string } {
   const cfg = loadMapping();
   const form: FormField[] = [];
@@ -167,6 +170,11 @@ export function buildApprovalForm(
     if (rows.length > 0) {
       form.push({ id: cfg.fieldList.widgetId, type: cfg.fieldList.widgetType, value: rows });
     }
+  }
+
+  // 图片控件：填入发票原图 url 数组
+  if (cfg.imageField && !isPlaceholder(cfg.imageField.widgetId) && imageUrls.length > 0) {
+    form.push({ id: cfg.imageField.widgetId, type: cfg.imageField.widgetType, value: imageUrls });
   }
 
   const fallback = `费用报销-${aggLabel}`;

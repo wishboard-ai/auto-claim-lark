@@ -6,9 +6,10 @@ import { downloadImage } from '../invoice/download';
 import { recognizeInvoice } from '../invoice/recognize';
 import { buildApprovalForm, FormOverrides } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
-import { addItem, getPending, clearPending } from './session';
+import { addItem, getPending, clearPending, CartItem } from './session';
 import { addedCard, successCard } from '../reply/cards';
 import { generateContent } from '../llm';
+import { uploadApprovalImage } from '../approval/uploadImage';
 
 const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '好'];
 const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
@@ -45,18 +46,27 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     });
   }
 
-  async function createFromInvoices(
+  async function createFromItems(
     chatId: string,
     openId: string,
-    invoices: RecognizedInvoice[]
+    items: CartItem[]
   ): Promise<void> {
+    const invoices = items.map((i) => i.invoice);
     let overrides: FormOverrides = {};
     const gen = await generateContent(cfg, invoices);
     if (gen) {
       overrides = { title: gen.title, reason: gen.reason, contents: gen.contents };
       logger.info(`LLM 生成标题：${gen.title}`);
     }
-    const { form, title } = buildApprovalForm(invoices, overrides);
+    // 上传发票原图，收集 url 填入「图片」控件（失败不阻断）
+    const imageUrls: string[] = [];
+    for (const it of items) {
+      if (it.imageBuffer) {
+        const url = await uploadApprovalImage(cfg, it.imageBuffer, `invoice.${it.imageExt || 'jpg'}`);
+        if (url) imageUrls.push(url);
+      }
+    }
+    const { form, title } = buildApprovalForm(invoices, overrides, imageUrls);
     if (form.length === 0) {
       await sendText(
         chatId,
@@ -71,6 +81,13 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       logger.error('创建审批失败', e);
       await sendText(chatId, `创建审批失败：${(e as Error).message}`);
     }
+  }
+
+  function imgExt(buf: Buffer): string {
+    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+    if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50) return 'png';
+    if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF') return 'webp';
+    return 'jpg';
   }
 
   async function handleImage(
@@ -90,10 +107,11 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       await sendText(chatId, '无法获取你的用户身份（open_id），无法发起审批。');
       return;
     }
+    const item: CartItem = { invoice, imageBuffer: buffer, imageExt: imgExt(buffer) };
     if (cfg.submitMode === 'direct') {
-      await createFromInvoices(chatId, openId, [invoice]);
+      await createFromItems(chatId, openId, [item]);
     } else {
-      const claim = addItem(openId, { invoice, imageBuffer: buffer });
+      const claim = addItem(openId, item);
       await sendCard(chatId, addedCard(claim.items.map((i) => i.invoice)));
     }
   }
@@ -110,9 +128,9 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
         await sendText(chatId, '没有待提交的报销。请先发送发票图片。');
         return;
       }
-      const invoices = pending.items.map((i) => i.invoice);
+      const items = pending.items;
       clearPending(openId);
-      await createFromInvoices(chatId, openId, invoices);
+      await createFromItems(chatId, openId, items);
     } else if (openId && CANCEL_WORDS.includes(text)) {
       clearPending(openId);
       await sendText(chatId, '已取消本次报销。');
