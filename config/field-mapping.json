@@ -1,0 +1,11 @@
+{
+  "_comment": "将识别到的发票字段映射到费用报销审批表单控件。运行 `npm run inspect:approval -- <approval_code>` 获取 widgetId 与类型，替换下面的 REPLACE_ 占位符。source 可用字段：amount/date/sellerName/buyerName/invoiceNo/taxAmount/summary/typeLabel，或 raw 中的原始字段名；也支持模板如 \"{sellerName}-{invoiceNo}\"。widgetType 需与审批控件类型一致（input/textarea/number/amount/date 等）。",
+  "title": "费用报销-{typeLabel}",
+  "fields": [
+    { "widgetId": "REPLACE_金额控件ID", "widgetType": "amount", "source": "amount" },
+    { "widgetId": "REPLACE_日期控件ID", "widgetType": "date", "source": "date" },
+    { "widgetId": "REPLACE_商家控件ID", "widgetType": "input", "source": "sellerName" },
+    { "widgetId": "REPLACE_发票号控件ID", "widgetType": "input", "source": "invoiceNo" },
+    { "widgetId": "REPLACE_事由控件ID", "widgetType": "textarea", "source": "summary" }
+  ]
+}

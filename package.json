@@ -1,0 +1,33 @@
+{
+  "name": "auto-claim-lark",
+  "version": "0.1.0",
+  "private": true,
+  "description": "飞书发票报销机器人：发票图片 → OCR 识别 → 自动创建费用报销审批实例（待用户手动提交）",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "start:local": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "inspect:approval": "tsx scripts/inspect-approval.ts"
+  },
+  "keywords": [
+    "feishu",
+    "lark",
+    "bot",
+    "ocr",
+    "invoice",
+    "approval"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.71.1",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
