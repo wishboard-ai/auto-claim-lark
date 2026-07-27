@@ -169,10 +169,15 @@ function extForImage(buf: Buffer): string {
   return 'jpg';
 }
 
-const DEFAULT_ORDER: SpecificType[] = ['taxi', 'train', 'vat'];
+const DEFAULT_ORDER: SpecificType[] = ['vat', 'taxi', 'train'];
+
+/** 得分达到此阈值即视为可信命中，提前结束，省下后续票种的识别调用。 */
+const CONFIDENT_SCORE = 3;
 
 /**
- * 识别发票：并行调用全部票种识别器，按特征字段打分选出最可能的票种。
+ * 识别发票：按 order 顺序逐个调用票种识别器，命中即止（节省 API 额度）。
+ * 某票种得分达到 CONFIDENT_SCORE 即认为可信，直接返回，不再调用后续识别器；
+ * 否则继续尝试，最终按特征字段打分选出最可能的票种。
  * 图片以临时文件 + ReadStream 传入（飞书 OCR 的 multipart 需要文件名，否则 400）。
  */
 export async function recognizeInvoice(
@@ -187,18 +192,20 @@ export async function recognizeInvoice(
   );
   await fs.promises.writeFile(tmpPath, file);
   try {
-    const results = await Promise.all(
-      order.map(async (t) => {
-        try {
-          const raw = await EXTRACTORS[t](client, tmpPath);
-          return buildCandidate(t, raw);
-        } catch (e) {
-          logger.warn(`${t} 识别调用失败：`, (e as Error).message);
-          return null;
-        }
-      })
-    );
-    const invoice = selectBest(results);
+    const candidates: Array<Candidate | null> = [];
+    for (const t of order) {
+      try {
+        const raw = await EXTRACTORS[t](client, tmpPath);
+        const c = buildCandidate(t, raw);
+        candidates.push(c);
+        // 得分足够高即认为命中，提前结束（后续票种不再消耗额度）
+        if (c && c.score >= CONFIDENT_SCORE) break;
+      } catch (e) {
+        logger.warn(`${t} 识别调用失败：`, (e as Error).message);
+        candidates.push(null);
+      }
+    }
+    const invoice = selectBest(candidates);
     if (invoice.type !== 'unknown') logger.info(`识别命中：${invoice.typeLabel}`);
     return invoice;
   } finally {
