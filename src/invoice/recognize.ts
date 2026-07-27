@@ -8,6 +8,25 @@ import { logger } from '../logger';
 type Entity = { type?: string; value?: string };
 type SpecificType = Exclude<InvoiceType, 'unknown'>;
 
+/** 飞书智能文档解析额度用尽的错误码。 */
+const QUOTA_LIMIT_CODE = 2110003;
+
+/** 识别额度用尽（document_ai 2110003）。用于向用户回复明确提示。 */
+export class QuotaExceededError extends Error {
+  constructor(message = '发票识别额度已用尽 (document_ai code 2110003)') {
+    super(message);
+    this.name = 'QuotaExceededError';
+  }
+}
+
+/** 判断某次识别调用的错误是否为「额度用尽」。兼容 SDK 不同的错误结构。 */
+function isQuotaLimitError(e: any): boolean {
+  const code = e?.response?.data?.code ?? e?.code;
+  if (code === QUOTA_LIMIT_CODE) return true;
+  const msg = String(e?.response?.data?.msg ?? e?.msg ?? e?.message ?? '');
+  return msg.includes('Intelligent document parsing limit');
+}
+
 export interface Candidate {
   invoice: RecognizedInvoice;
   score: number;
@@ -193,6 +212,7 @@ export async function recognizeInvoice(
   await fs.promises.writeFile(tmpPath, file);
   try {
     const candidates: Array<Candidate | null> = [];
+    let quotaExceeded = false;
     for (const t of order) {
       try {
         const raw = await EXTRACTORS[t](client, tmpPath);
@@ -201,11 +221,14 @@ export async function recognizeInvoice(
         // 得分足够高即认为命中，提前结束（后续票种不再消耗额度）
         if (c && c.score >= CONFIDENT_SCORE) break;
       } catch (e) {
+        if (isQuotaLimitError(e)) quotaExceeded = true;
         logger.warn(`${t} 识别调用失败：`, (e as Error).message);
         candidates.push(null);
       }
     }
     const invoice = selectBest(candidates);
+    // 所有识别器均因额度用尽而失败时，抛出专门错误以便给用户明确提示
+    if (invoice.type === 'unknown' && quotaExceeded) throw new QuotaExceededError();
     if (invoice.type !== 'unknown') logger.info(`识别命中：${invoice.typeLabel}`);
     return invoice;
   } finally {

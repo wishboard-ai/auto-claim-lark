@@ -3,7 +3,7 @@ import { AppConfig } from '../config';
 import { logger } from '../logger';
 import { RecognizedInvoice } from '../types';
 import { downloadImage } from '../invoice/download';
-import { recognizeInvoice } from '../invoice/recognize';
+import { recognizeInvoice, QuotaExceededError } from '../invoice/recognize';
 import { buildApprovalForm, FormOverrides } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
 import { addItem, getPending, clearPending, CartItem } from './session';
@@ -100,7 +100,19 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   ): Promise<void> {
     const imageKey = JSON.parse(content).image_key as string;
     const buffer = await downloadImage(client, messageId, imageKey);
-    const invoice = await recognizeInvoice(client, buffer);
+    let invoice: RecognizedInvoice;
+    try {
+      invoice = await recognizeInvoice(client, buffer);
+    } catch (e) {
+      if (e instanceof QuotaExceededError) {
+        await sendText(
+          chatId,
+          '发票识别额度已用尽，暂时无法识别 😥\n请联系管理员在飞书开放平台申请 / 购买智能文档解析（document_ai）额度后再试。'
+        );
+        return;
+      }
+      throw e;
+    }
     if (invoice.type === 'unknown') {
       await sendText(chatId, '未能识别该图片中的发票信息，请确认是清晰的增值税发票 / 火车票 / 出租车票图片。');
       return;
