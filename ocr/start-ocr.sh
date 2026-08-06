@@ -2,7 +2,8 @@
 # 启动本地 PaddleOCR 服务（macOS / Linux）。
 # 首次会创建虚拟环境并安装依赖（较慢，需联网下载 paddle 与 OCR 模型）。
 # 自动选择受支持的较高 Python（paddlepaddle 2.6 支持到 3.12）。SKIP_UPDATE=1 跳过更新检查。
-set -euo pipefail
+# 注意：macOS 自带 bash 3.2，不启用 -u(nounset) 以避免数组/变量展开误报 unbound
+set -eo pipefail
 cd "$(dirname "$0")"
 
 # 选择 Python 解释器：优先 3.12 -> 3.11 -> 3.10 -> python3

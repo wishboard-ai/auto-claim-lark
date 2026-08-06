@@ -4,7 +4,8 @@
 # 每次启动会「检查更新」：git pull + 装依赖 + 编译，再运行。
 # 若 .env 使用本地 Ollama：自动安装 Ollama（缺失时）、拉起服务、并拉取所需模型。
 # 设环境变量 SKIP_UPDATE=1 可跳过 git 更新检查。
-set -euo pipefail
+# 注意：macOS 自带 bash 3.2，set -u(nounset) 与数组展开组合会误报 unbound，故不启用 -u
+set -eo pipefail
 
 cd "$(dirname "$0")"
 
