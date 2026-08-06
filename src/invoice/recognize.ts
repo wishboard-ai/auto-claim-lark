@@ -157,6 +157,77 @@ function isQuotaOrBillingError(status: number, bodyText: string): boolean {
   );
 }
 
+// 是否为本地 Ollama 端点
+function isLocalOllama(baseUrl: string): boolean {
+  return /(?:localhost|127\.0\.0\.1):11434/.test(baseUrl);
+}
+
+// 由 OpenAI 兼容 base（.../v1）推出 Ollama 原生 API 根地址
+function ollamaRoot(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '');
+}
+
+// 同一模型的拉取只进行一次（并发请求共享同一个 Promise；失败则允许后续重试）
+const pullInFlight = new Map<string, Promise<void>>();
+
+/** 调用 Ollama /api/pull 流式拉取模型，读取进度以保持连接、避免超时。 */
+async function pullOllamaModel(baseUrl: string, model: string): Promise<void> {
+  const key = `${ollamaRoot(baseUrl)}|${model}`;
+  const existing = pullInFlight.get(key);
+  if (existing) return existing;
+
+  const task = (async () => {
+    const url = `${ollamaRoot(baseUrl)}/api/pull`;
+    const t0 = Date.now();
+    logger.info(`Ollama 模型未就绪，自动拉取：${model}（首次较慢，请稍候）…`);
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: model }), // 默认流式，返回 NDJSON 进度
+    });
+    if (!resp.ok || !resp.body) {
+      const b = await resp.text().catch(() => '');
+      throw new Error(`自动拉取模型失败 HTTP ${resp.status}：${b.slice(0, 200)}`);
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let lastLog = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        try {
+          const o: any = JSON.parse(line);
+          if (o.error) throw new Error(String(o.error));
+          const now = Date.now();
+          if (o.status && now - lastLog > 3000) {
+            const pct = o.completed && o.total ? ` ${Math.floor((o.completed / o.total) * 100)}%` : '';
+            logger.info(`拉取 ${model}：${o.status}${pct}`);
+            lastLog = now;
+          }
+        } catch {
+          /* 忽略半行/非 JSON */
+        }
+      }
+    }
+    logger.info(`模型拉取完成：${model}（耗时 ${Math.floor((Date.now() - t0) / 1000)}s）`);
+  })();
+
+  // 失败时移除缓存，允许下次重试；成功则保留（避免重复拉取）
+  const guarded = task.catch((e) => {
+    pullInFlight.delete(key);
+    throw e;
+  });
+  pullInFlight.set(key, guarded);
+  return guarded;
+}
+
 async function recognizeViaOpenAI(cfg: AppConfig, file: Buffer): Promise<RecognizedInvoice> {
   const { ocr } = cfg;
   if (!ocr.apiKey) throw new OcrNotConfiguredError();
@@ -165,35 +236,51 @@ async function recognizeViaOpenAI(cfg: AppConfig, file: Buffer): Promise<Recogni
   const url = `${ocr.baseUrl.replace(/\/$/, '')}/chat/completions`;
   logger.info(`调用 OCR 识别（provider=openai, model=${ocr.model}, 图片 ${file.length} 字节）…`);
 
-  let resp: Response;
-  try {
-    resp = await fetch(url, {
+  const body = JSON.stringify({
+    model: ocr.model,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: dataUri } },
+          { type: 'text', text: EXTRACT_PROMPT },
+        ],
+      },
+    ],
+    temperature: 0,
+  });
+  const postChat = () =>
+    fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ocr.apiKey}` },
-      body: JSON.stringify({
-        model: ocr.model,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'image_url', image_url: { url: dataUri } },
-              { type: 'text', text: EXTRACT_PROMPT },
-            ],
-          },
-        ],
-        temperature: 0,
-      }),
+      body,
     });
+
+  let resp: Response;
+  try {
+    resp = await postChat();
   } catch (e) {
     logger.warn('OCR 请求发送失败：', (e as Error).message);
     throw e;
   }
 
   if (!resp.ok) {
-    const bodyText = await resp.text().catch(() => '');
-    logger.warn(`OCR 调用失败 HTTP ${resp.status}：${bodyText.slice(0, 300)}`);
-    if (isQuotaOrBillingError(resp.status, bodyText)) throw new QuotaExceededError();
-    throw new Error(`OCR 调用失败 HTTP ${resp.status}`);
+    let bodyText = await resp.text().catch(() => '');
+    // 本地 Ollama 且模型未拉取（404 model not found）→ 自动拉取并重试一次
+    if (resp.status === 404 && isLocalOllama(ocr.baseUrl) && /not\s*found/i.test(bodyText)) {
+      try {
+        await pullOllamaModel(ocr.baseUrl, ocr.model);
+        resp = await postChat();
+      } catch (e) {
+        throw new Error(`自动拉取模型失败：${(e as Error).message}`);
+      }
+      if (!resp.ok) bodyText = await resp.text().catch(() => '');
+    }
+    if (!resp.ok) {
+      logger.warn(`OCR 调用失败 HTTP ${resp.status}：${bodyText.slice(0, 300)}`);
+      if (isQuotaOrBillingError(resp.status, bodyText)) throw new QuotaExceededError();
+      throw new Error(`OCR 调用失败 HTTP ${resp.status}`);
+    }
   }
 
   const data: any = await resp.json();
