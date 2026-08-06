@@ -1,237 +1,262 @@
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import * as lark from '@larksuiteoapi/node-sdk';
+import { AppConfig } from '../config';
 import { InvoiceType, RecognizedInvoice } from '../types';
 import { logger } from '../logger';
 
-type Entity = { type?: string; value?: string };
-type SpecificType = Exclude<InvoiceType, 'unknown'>;
+/**
+ * 发票识别。支持两种后端（OCR_PROVIDER）：
+ * - openai：OpenAI 兼容的多模态大模型（云端 qwen-vl-max，或本地 Ollama 的 qwen2.5vl）。
+ * - paddle：本地 PaddleOCR 微服务（见 ocr/ocr_service.py），零 API 成本、适合低配机器。
+ * 两种后端都产出统一的结构化 JSON，经同一 buildFromParsed 归一化为 RecognizedInvoice。
+ */
 
-/** 飞书智能文档解析额度用尽的错误码。 */
-const QUOTA_LIMIT_CODE = 2110003;
-
-/** 识别额度用尽（document_ai 2110003）。用于向用户回复明确提示。 */
+/** 识别额度/费用相关错误（额度用尽、欠费、限流）。用于向用户回复明确提示。 */
 export class QuotaExceededError extends Error {
-  constructor(message = '发票识别额度已用尽 (document_ai code 2110003)') {
+  constructor(message = '发票识别额度已用尽或账户欠费') {
     super(message);
     this.name = 'QuotaExceededError';
   }
 }
 
-/** 判断某次识别调用的错误是否为「额度用尽」。兼容 SDK 不同的错误结构。 */
-function isQuotaLimitError(e: any): boolean {
-  const code = e?.response?.data?.code ?? e?.code;
-  if (code === QUOTA_LIMIT_CODE) return true;
-  const msg = String(e?.response?.data?.msg ?? e?.msg ?? e?.message ?? '');
-  return msg.includes('Intelligent document parsing limit');
-}
-
-export interface Candidate {
-  invoice: RecognizedInvoice;
-  score: number;
-}
-
-function entitiesToMap(entities?: Entity[]): Record<string, string> {
-  const map: Record<string, string> = {};
-  for (const e of entities ?? []) {
-    if (e.type && e.value != null && String(e.value).trim() !== '' && map[e.type] === undefined) {
-      map[e.type] = String(e.value).trim();
-    }
+/** 未配置 OCR（缺少 API Key）时抛出，便于给出配置指引。 */
+export class OcrNotConfiguredError extends Error {
+  constructor(message = '未配置发票识别服务（缺少 OCR/LLM API Key）') {
+    super(message);
+    this.name = 'OcrNotConfiguredError';
   }
-  return map;
 }
 
-function normAmount(v?: string): string | undefined {
-  if (!v) return undefined;
-  const m = v.replace(/[,，]/g, '').match(/-?\d+(?:\.\d+)?/);
+// ---- 归一化工具（金额 / 日期） ----
+
+function normAmount(v?: unknown): string | undefined {
+  if (v == null) return undefined;
+  const m = String(v).replace(/[,，]/g, '').match(/-?\d+(?:\.\d+)?/);
   return m ? m[0] : undefined;
 }
 
-function normDate(v?: string): string | undefined {
-  if (!v) return undefined;
-  let m = v.match(/(\d{4})\D+(\d{1,2})\D+(\d{1,2})/);
+function normDate(v?: unknown): string | undefined {
+  if (v == null) return undefined;
+  const s = String(v);
+  let m = s.match(/(\d{4})\D+(\d{1,2})\D+(\d{1,2})/);
   if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
-  m = v.match(/(\d{4})(\d{2})(\d{2})/);
+  m = s.match(/(\d{4})(\d{2})(\d{2})/);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  return v;
+  const t = s.trim();
+  return t || undefined;
 }
 
-/**
- * 各票种的「特征字段」权重。
- * 关键在于：taxi/train 拥有增值税发票绝不会有的身份字段（车号、里程、车次、站点），
- * 给它们高权重，使其在同一图片上稳压增值税识别器的通用字段（发票号/代码）。
- */
-const WEIGHTS: Record<SpecificType, Record<string, number>> = {
-  taxi: {
-    car_number: 4,
-    distance: 3,
-    dispatch_fee: 2,
-    additional_fee: 1,
-    start_time: 1,
-    end_time: 1,
-    total_amount: 1,
-    invoice_no: 0.5,
-  },
-  train: {
-    train_num: 4,
-    start_station: 2,
-    end_station: 2,
-    seat_num: 1,
-    seat_cls: 1,
-    ticket_num: 1,
-    total_amount: 1,
-  },
-  vat: {
-    seller_taxpayer_no: 2,
-    buyer_taxpayer_no: 2,
-    total_tax: 2,
-    invoice_special_seal: 1,
-    total_price_and_tax: 1,
-    invoice_no: 0.5,
-    invoice_code: 0.5,
-  },
-};
-
-function scoreOf(raw: Record<string, string>, weights: Record<string, number>): number {
-  let s = 0;
-  for (const [k, w] of Object.entries(weights)) if (raw[k]) s += w;
-  return s;
+function strOrUndef(v?: unknown): string | undefined {
+  if (v == null) return undefined;
+  const s = String(v).trim();
+  return s && s.toLowerCase() !== 'null' && s !== '无' ? s : undefined;
 }
 
-/** 由原始字段构造候选（纯函数，便于单测分类逻辑）。score<=0 视为未命中。 */
-export function buildCandidate(type: SpecificType, raw: Record<string, string>): Candidate | null {
-  const score = scoreOf(raw, WEIGHTS[type]);
-  if (score <= 0) return null;
+// ---- 图片 MIME 识别 ----
 
-  let invoice: RecognizedInvoice;
-  if (type === 'taxi') {
-    const timeRange = raw.start_time
-      ? `${raw.start_time}${raw.end_time ? '-' + raw.end_time : ''}`
-      : '';
-    invoice = {
-      type: 'taxi',
-      typeLabel: '出租车票',
-      amount: normAmount(raw.total_amount || raw.price),
-      date: normDate(raw.start_date),
-      sellerName: '出租车',
-      invoiceNo: raw.invoice_no,
-      summary: [timeRange, raw.distance ? `${raw.distance}km` : ''].filter(Boolean).join(' ') || undefined,
-      raw,
-    };
-  } else if (type === 'train') {
-    const route = [raw.start_station, raw.end_station].filter(Boolean).join(' → ');
-    invoice = {
-      type: 'train',
-      typeLabel: '火车票',
-      amount: normAmount(raw.total_amount || raw.price),
-      date: normDate(raw.time),
-      sellerName: '中国铁路',
-      invoiceNo: raw.ticket_num,
-      summary: [route, raw.train_num, raw.seat_cls].filter(Boolean).join(' ') || undefined,
-      raw,
-    };
-  } else {
-    invoice = {
-      type: 'vat',
-      typeLabel: raw.invoice_name || '增值税发票',
-      amount: normAmount(raw.total_price_and_tax || raw.total_price),
-      date: normDate(raw.invoice_date),
-      sellerName: raw.seller_name,
-      buyerName: raw.buyer_name,
-      invoiceNo: raw.invoice_no,
-      taxAmount: normAmount(raw.total_tax),
-      summary: raw.remarks || undefined,
-      raw,
-    };
-  }
-  return { invoice, score };
+function mimeForImage(buf: Buffer): string {
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  if (buf.length >= 3 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image/gif';
+  if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return 'image/bmp';
+  return 'image/jpeg';
 }
 
-/** 从候选中选出得分最高者；特征更强的票种胜出。无候选则未知票据。 */
-export function selectBest(candidates: Array<Candidate | null>): RecognizedInvoice {
-  const valid = candidates.filter((c): c is Candidate => !!c);
-  if (valid.length === 0) return { type: 'unknown', typeLabel: '未知票据', raw: {} };
-  valid.sort((a, b) => b.score - a.score);
-  logger.debug('识别候选得分：', valid.map((c) => `${c.invoice.type}=${c.score}`).join(', '));
-  return valid[0].invoice;
-}
+// ---- JSON 解析（容忍模型包裹 ```json 代码块或前后多余文字） ----
 
-// 各票种调用飞书对应识别端点，返回原始字段 map（每次新建 ReadStream，流只能消费一次）。
-const EXTRACTORS: Record<SpecificType, (client: lark.Client, filePath: string) => Promise<Record<string, string>>> = {
-  vat: async (client, filePath) => {
-    const resp = (await client.document_ai.v1.vatInvoice.recognize({
-      data: { file: fs.createReadStream(filePath) },
-    })) as any;
-    return entitiesToMap(resp?.vat_invoices?.[0]?.entities ?? resp?.data?.vat_invoices?.[0]?.entities);
-  },
-  train: async (client, filePath) => {
-    const resp = (await client.document_ai.v1.trainInvoice.recognize({
-      data: { file: fs.createReadStream(filePath) },
-    })) as any;
-    return entitiesToMap(resp?.train_invoices?.[0]?.entities ?? resp?.data?.train_invoices?.[0]?.entities);
-  },
-  taxi: async (client, filePath) => {
-    const resp = (await client.document_ai.v1.taxiInvoice.recognize({
-      data: { file: fs.createReadStream(filePath) },
-    })) as any;
-    return entitiesToMap(resp?.taxi_invoices?.[0]?.entities ?? resp?.data?.taxi_invoices?.[0]?.entities);
-  },
-};
-
-function extForImage(buf: Buffer): string {
-  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
-  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
-  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'webp';
-  if (buf.length >= 3 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'gif';
-  if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp';
-  return 'jpg';
-}
-
-const DEFAULT_ORDER: SpecificType[] = ['vat', 'taxi', 'train'];
-
-/** 得分达到此阈值即视为可信命中，提前结束，省下后续票种的识别调用。 */
-const CONFIDENT_SCORE = 3;
-
-/**
- * 识别发票：按 order 顺序逐个调用票种识别器，命中即止（节省 API 额度）。
- * 某票种得分达到 CONFIDENT_SCORE 即认为可信，直接返回，不再调用后续识别器；
- * 否则继续尝试，最终按特征字段打分选出最可能的票种。
- * 图片以临时文件 + ReadStream 传入（飞书 OCR 的 multipart 需要文件名，否则 400）。
- */
-export async function recognizeInvoice(
-  client: lark.Client,
-  file: Buffer,
-  order: SpecificType[] = DEFAULT_ORDER
-): Promise<RecognizedInvoice> {
-  const ext = extForImage(file);
-  const tmpPath = path.join(
-    os.tmpdir(),
-    `invoice_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`
-  );
-  await fs.promises.writeFile(tmpPath, file);
+function extractJson(text: string): any | null {
+  const stripped = text.replace(/```json/gi, '').replace(/```/g, '').trim();
   try {
-    const candidates: Array<Candidate | null> = [];
-    let quotaExceeded = false;
-    for (const t of order) {
-      try {
-        const raw = await EXTRACTORS[t](client, tmpPath);
-        const c = buildCandidate(t, raw);
-        candidates.push(c);
-        // 得分足够高即认为命中，提前结束（后续票种不再消耗额度）
-        if (c && c.score >= CONFIDENT_SCORE) break;
-      } catch (e) {
-        if (isQuotaLimitError(e)) quotaExceeded = true;
-        logger.warn(`${t} 识别调用失败：`, (e as Error).message);
-        candidates.push(null);
-      }
-    }
-    const invoice = selectBest(candidates);
-    // 所有识别器均因额度用尽而失败时，抛出专门错误以便给用户明确提示
-    if (invoice.type === 'unknown' && quotaExceeded) throw new QuotaExceededError();
-    if (invoice.type !== 'unknown') logger.info(`识别命中：${invoice.typeLabel}`);
-    return invoice;
-  } finally {
-    fs.promises.unlink(tmpPath).catch(() => {});
+    return JSON.parse(stripped);
+  } catch {
+    /* ignore */
   }
+  const m = stripped.match(/\{[\s\S]*\}/);
+  if (m) {
+    try {
+      return JSON.parse(m[0]);
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+const TYPE_LABELS: Record<Exclude<InvoiceType, 'unknown'>, string> = {
+  vat: '增值税发票',
+  train: '火车票',
+  taxi: '出租车票',
+};
+
+/** 统一映射：结构化对象 -> RecognizedInvoice（两种 provider 共用）。 */
+function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
+  const rawType = String(parsed.type || '').toLowerCase();
+  const type: InvoiceType =
+    rawType === 'vat' || rawType === 'train' || rawType === 'taxi' ? (rawType as InvoiceType) : 'unknown';
+
+  if (type === 'unknown') {
+    logger.warn(`未识别为已知票种（vat/train/taxi）：type=${JSON.stringify(parsed.type)}`);
+    return { type: 'unknown', typeLabel: '未知票据', raw: normalizeRaw(parsed) };
+  }
+
+  const invoice: RecognizedInvoice = {
+    type,
+    typeLabel: strOrUndef(parsed.typeLabel) || TYPE_LABELS[type],
+    amount: normAmount(parsed.amount),
+    date: normDate(parsed.date),
+    sellerName:
+      strOrUndef(parsed.sellerName) || (type === 'train' ? '中国铁路' : type === 'taxi' ? '出租车' : undefined),
+    buyerName: strOrUndef(parsed.buyerName),
+    invoiceNo: strOrUndef(parsed.invoiceNo),
+    taxAmount: normAmount(parsed.taxAmount),
+    summary: strOrUndef(parsed.summary),
+    raw: normalizeRaw(parsed),
+  };
+  logger.info(`识别命中：${invoice.typeLabel}`);
+  return invoice;
+}
+
+/** 把结构化对象扁平化为 Record<string,string>，便于调试与字段映射的 raw 取值。 */
+function normalizeRaw(parsed: Record<string, unknown>): Record<string, string> {
+  const raw: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (v == null) continue;
+    const s = String(v).trim();
+    if (s) raw[k] = s;
+  }
+  return raw;
+}
+
+// ============ provider: openai（多模态大模型） ============
+
+const EXTRACT_PROMPT =
+  '你是发票识别助手。请识别图片中的票据类型并抽取关键字段，只返回一个严格的 JSON 对象，' +
+  '不要输出任何解释、Markdown 代码块或多余文字。字段说明：\n' +
+  '- type: 票种，取值 "vat"(增值税发票/电子发票/普票专票)、"train"(火车票)、"taxi"(出租车票/网约车行程单)，无法判断填 "unknown"；\n' +
+  '- amount: 金额（元），增值税发票取价税合计，火车票/出租车取总额，只要数字；\n' +
+  '- date: 开票/乘车日期，格式 YYYY-MM-DD；\n' +
+  '- sellerName: 销售方/商家/承运方名称；\n' +
+  '- buyerName: 购买方名称（无则留空）；\n' +
+  '- invoiceNo: 发票号码/票号；\n' +
+  '- taxAmount: 税额（元，仅增值税发票，只要数字，无则留空）；\n' +
+  '- summary: 摘要（如 出发站→到达站、车次、里程、时间等，无则留空）。\n' +
+  '严禁编造图片中不存在的信息，找不到的字段填空字符串。\n' +
+  '返回示例：{"type":"train","amount":"553.5","date":"2024-01-15","sellerName":"中国铁路",' +
+  '"buyerName":"","invoiceNo":"E123456789","taxAmount":"","summary":"北京南→上海虹桥 G1 二等座"}';
+
+function isQuotaOrBillingError(status: number, bodyText: string): boolean {
+  if (status === 429) return true;
+  const t = bodyText.toLowerCase();
+  return (
+    t.includes('arrearage') ||
+    t.includes('insufficient') ||
+    t.includes('quota') ||
+    t.includes('throttling') ||
+    t.includes('allocated') ||
+    t.includes('欠费') ||
+    t.includes('额度')
+  );
+}
+
+async function recognizeViaOpenAI(cfg: AppConfig, file: Buffer): Promise<RecognizedInvoice> {
+  const { ocr } = cfg;
+  if (!ocr.apiKey) throw new OcrNotConfiguredError();
+
+  const dataUri = `data:${mimeForImage(file)};base64,${file.toString('base64')}`;
+  const url = `${ocr.baseUrl.replace(/\/$/, '')}/chat/completions`;
+  logger.info(`调用 OCR 识别（provider=openai, model=${ocr.model}, 图片 ${file.length} 字节）…`);
+
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ocr.apiKey}` },
+      body: JSON.stringify({
+        model: ocr.model,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'image_url', image_url: { url: dataUri } },
+              { type: 'text', text: EXTRACT_PROMPT },
+            ],
+          },
+        ],
+        temperature: 0,
+      }),
+    });
+  } catch (e) {
+    logger.warn('OCR 请求发送失败：', (e as Error).message);
+    throw e;
+  }
+
+  if (!resp.ok) {
+    const bodyText = await resp.text().catch(() => '');
+    logger.warn(`OCR 调用失败 HTTP ${resp.status}：${bodyText.slice(0, 300)}`);
+    if (isQuotaOrBillingError(resp.status, bodyText)) throw new QuotaExceededError();
+    throw new Error(`OCR 调用失败 HTTP ${resp.status}`);
+  }
+
+  const data: any = await resp.json();
+  const text: string | undefined = data?.choices?.[0]?.message?.content;
+  if (!text) {
+    logger.warn('OCR 返回为空');
+    return { type: 'unknown', typeLabel: '未知票据', raw: {} };
+  }
+  logger.debug(`OCR(${ocr.model}) 原始返回：${text.slice(0, 500)}`);
+
+  const parsed = extractJson(text);
+  if (!parsed || typeof parsed !== 'object') {
+    logger.warn('OCR 返回无法解析为 JSON：', text.slice(0, 200));
+    return { type: 'unknown', typeLabel: '未知票据', raw: { text } };
+  }
+  return buildFromParsed(parsed);
+}
+
+// ============ provider: paddle（本地 PaddleOCR 微服务） ============
+
+async function recognizeViaPaddle(cfg: AppConfig, file: Buffer): Promise<RecognizedInvoice> {
+  const { ocr } = cfg;
+  const url = `${ocr.baseUrl.replace(/\/$/, '')}/recognize`;
+  logger.info(`调用 OCR 识别（provider=paddle, ${url}, 图片 ${file.length} 字节）…`);
+
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': mimeForImage(file) },
+      // Node 原生 fetch 接受 Uint8Array 作为 body；用 any 规避 DOM BodyInit 类型缺失
+      body: new Uint8Array(file) as any,
+    });
+  } catch (e) {
+    logger.warn('本地 PaddleOCR 服务连接失败：', (e as Error).message);
+    throw new Error(
+      `无法连接本地 OCR 服务 ${ocr.baseUrl}。请先启动 PaddleOCR 服务（见 ocr/README.md）。`
+    );
+  }
+
+  if (!resp.ok) {
+    const bodyText = await resp.text().catch(() => '');
+    logger.warn(`本地 PaddleOCR HTTP ${resp.status}：${bodyText.slice(0, 300)}`);
+    throw new Error(`本地 OCR 服务错误 HTTP ${resp.status}`);
+  }
+
+  const parsed: any = await resp.json().catch(() => null);
+  if (!parsed || typeof parsed !== 'object') {
+    logger.warn('本地 PaddleOCR 返回无法解析为 JSON');
+    return { type: 'unknown', typeLabel: '未知票据', raw: {} };
+  }
+  logger.debug(`PaddleOCR 返回：${JSON.stringify(parsed).slice(0, 500)}`);
+  return buildFromParsed(parsed);
+}
+
+// ============ 分发入口 ============
+
+/**
+ * 识别发票：按 OCR_PROVIDER 选择后端。识别不出票种时返回 { type: 'unknown' }。
+ */
+export async function recognizeInvoice(cfg: AppConfig, file: Buffer): Promise<RecognizedInvoice> {
+  const { ocr } = cfg;
+  if (!ocr.enabled) throw new OcrNotConfiguredError();
+  if (ocr.provider === 'paddle') return recognizeViaPaddle(cfg, file);
+  return recognizeViaOpenAI(cfg, file);
 }

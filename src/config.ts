@@ -47,11 +47,25 @@ export interface LlmConfig {
   model: string;
 }
 
+/**
+ * 发票 OCR 识别配置。provider 决定后端：
+ * - openai：OpenAI 兼容多模态大模型（云端 qwen-vl-max / 本地 Ollama qwen2.5vl）。默认复用 LLM_API_KEY/LLM_BASE_URL。
+ * - paddle：本地 PaddleOCR 微服务（默认 http://localhost:8000），无需 API Key。
+ */
+export interface OcrConfig {
+  provider: 'openai' | 'paddle';
+  enabled: boolean;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
 /** 机器人完整运行配置 */
 export interface AppConfig extends Credentials {
   approvalCode: string;
   submitMode: SubmitMode;
   llm: LlmConfig;
+  ocr: OcrConfig;
 }
 
 export function loadCredentials(): Credentials {
@@ -74,10 +88,27 @@ export function loadConfig(): AppConfig {
     apiKey,
     model: opt('LLM_MODEL', 'gpt-4o-mini'),
   };
+  // OCR 后端：openai（多模态大模型）| paddle（本地 PaddleOCR 服务）
+  const provider: OcrConfig['provider'] =
+    opt('OCR_PROVIDER', 'openai').toLowerCase() === 'paddle' ? 'paddle' : 'openai';
+  const ocrApiKey = opt('OCR_API_KEY', apiKey);
+  const ocrDefaultBase =
+    provider === 'paddle'
+      ? 'http://localhost:8000'
+      : opt('LLM_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1');
+  const ocr: OcrConfig = {
+    provider,
+    // paddle 后端无需 API Key；openai 后端需要 key 才算启用
+    enabled: provider === 'paddle' ? true : !!ocrApiKey,
+    baseUrl: opt('OCR_BASE_URL', ocrDefaultBase),
+    apiKey: ocrApiKey,
+    model: opt('OCR_MODEL', 'qwen-vl-max'),
+  };
   return {
     ...creds,
     approvalCode: req('APPROVAL_CODE'),
     submitMode,
     llm,
+    ocr,
   };
 }

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS 开机自启 / 常驻守护配置（launchd）。
+  部署步骤（在苹果一体机上）：
+    1. 把本项目放到某个目录，例如 /Users/<你>/apps/auto-claim-lark
+    2. 编译一次： npm install && npm run build
+    3. 修改下方两处占位：
+       - {{NODE_PATH}}   → 执行 `which node` 的输出，例如 /opt/homebrew/bin/node
+       - {{PROJECT_DIR}} → 项目绝对路径，例如 /Users/你/apps/auto-claim-lark
+    4. 拷贝到用户级 LaunchAgents 并加载：
+         cp deploy/com.autoclaim.lark.plist ~/Library/LaunchAgents/
+         launchctl load  ~/Library/LaunchAgents/com.autoclaim.lark.plist   # 启动+开机自启
+         launchctl unload ~/Library/LaunchAgents/com.autoclaim.lark.plist  # 停止
+  日志见 {{PROJECT_DIR}}/logs/ 下的 out.log / err.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.autoclaim.lark</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{NODE_PATH}}</string>
+    <string>{{PROJECT_DIR}}/dist/src/index.js</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{PROJECT_DIR}}</string>
+
+  <!-- 崩溃/退出后自动拉起，实现常驻 -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>{{PROJECT_DIR}}/logs/out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{PROJECT_DIR}}/logs/err.log</string>
+
+  <!-- 确保能找到 ollama（Homebrew 路径）；如用 Intel Mac 改为 /usr/local/bin -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>

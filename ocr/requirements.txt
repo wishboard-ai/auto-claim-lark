@@ -1,0 +1,8 @@
+# 本地 PaddleOCR 服务依赖
+# 建议 Python 3.10 或 3.11（paddlepaddle 对 3.12 支持有限）。
+paddlepaddle>=2.5,<2.7
+paddleocr>=2.7,<2.8
+numpy<2
+opencv-python-headless>=4.6
+fastapi>=0.110
+uvicorn[standard]>=0.29

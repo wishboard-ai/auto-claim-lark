@@ -3,7 +3,7 @@ import { AppConfig } from '../config';
 import { logger } from '../logger';
 import { RecognizedInvoice } from '../types';
 import { downloadImage } from '../invoice/download';
-import { recognizeInvoice, QuotaExceededError } from '../invoice/recognize';
+import { recognizeInvoice, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
 import { buildApprovalForm, FormOverrides } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
 import { addItem, getPending, clearPending, CartItem } from './session';
@@ -99,15 +99,24 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     content: string
   ): Promise<void> {
     const imageKey = JSON.parse(content).image_key as string;
+    logger.info(`收到图片消息（messageId=${messageId}），开始下载…`);
     const buffer = await downloadImage(client, messageId, imageKey);
+    logger.info(`图片已下载：${buffer.length} 字节`);
     let invoice: RecognizedInvoice;
     try {
-      invoice = await recognizeInvoice(client, buffer);
+      invoice = await recognizeInvoice(cfg, buffer);
     } catch (e) {
       if (e instanceof QuotaExceededError) {
         await sendText(
           chatId,
-          '发票识别额度已用尽，暂时无法识别 😥\n请联系管理员在飞书开放平台申请 / 购买智能文档解析（document_ai）额度后再试。'
+          '发票识别额度已用尽或账户欠费，暂时无法识别 😥\n请联系管理员在阿里云百炼（DashScope）控制台确认 qwen-vl-ocr 的额度 / 账户余额后再试。'
+        );
+        return;
+      }
+      if (e instanceof OcrNotConfiguredError) {
+        await sendText(
+          chatId,
+          '尚未配置发票识别服务。请在 .env 中填写百炼 API Key（LLM_API_KEY，或单独的 OCR_API_KEY）后重启服务。'
         );
         return;
       }
