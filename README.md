@@ -125,6 +125,8 @@ npm run dev                  # 开发模式（tsx watch 热重载，仅供开发
 
 Apple Silicon（M 系列）的统一内存 + Metal 加速非常适合本地跑视觉模型，可实现 **OCR + 文案全本地、零 API 成本**。
 
+> **关于显卡**：Ollama 会**自动使用可用 GPU**（Apple Silicon 的 Metal、NVIDIA 的 CUDA），无 GPU 时才回退 CPU——无需任何设置，也**不要**去设 `CUDA_VISIBLE_DEVICES=""` 之类禁用 GPU 的变量。`qwen2.5vl:3b` 这类模型在有显卡的机器上会自动走显卡加速。`start.sh` 也会在缺 Ollama/模型时自动安装并拉取。
+
 **步骤**：
 
 ```bash
@@ -167,7 +169,7 @@ launchctl load ~/Library/LaunchAgents/com.autoclaim.lark.plist   # 启动并开�
 
 ```bash
 # 1) 启动本地 PaddleOCR 服务（首次会建 venv、装依赖、下载模型）
-cd ocr && chmod +x start-ocr.sh && ./start-ocr.sh    # 需 Python 3.10/3.11
+cd ocr && chmod +x start-ocr.sh && ./start-ocr.sh    # 自动选用 Python 3.12/3.11/3.10
 
 # 2) 主服务 .env 指向本地 OCR
 #   OCR_PROVIDER=paddle
