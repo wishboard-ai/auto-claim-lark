@@ -124,6 +124,17 @@ if [ "$NEED_OLLAMA" = "1" ]; then
   fi
 fi
 
+# paddle 模式：检查本地 PaddleOCR 服务是否就绪（仅提示，不阻断）
+if [ "$OCR_PROVIDER_V" = "paddle" ]; then
+  PBASE="${OCR_BASE_V:-http://localhost:8000}"
+  if curl -fsS "${PBASE%/}/health" >/dev/null 2>&1; then
+    echo "[PaddleOCR] 本地 OCR 服务已就绪：$PBASE"
+  else
+    echo "[PaddleOCR] 本地 OCR 服务（$PBASE）未就绪！请另开终端启动： cd ocr && ./start-ocr.sh"
+    echo "            或用 deploy/com.autoclaim.ocr.plist 设为开机自启。否则识别会连接失败。"
+  fi
+fi
+
 # ---------- 编译并运行 ----------
 echo "[2/3] 编译 TypeScript…"
 npm run build
