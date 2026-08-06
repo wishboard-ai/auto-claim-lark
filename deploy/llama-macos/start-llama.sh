@@ -1,79 +1,62 @@
 #!/usr/bin/env bash
-# 在 Intel CPU + AMD 独显的 macOS 上，用 GPU（经 Vulkan/MoltenVK）跑视觉模型（llama.cpp）。
+# 在 Intel CPU + AMD 独显的 macOS 上，用 GPU（Vulkan / MoltenVK）跑视觉模型（llama.cpp）。
+# 本脚本为「已在真实机器（AMD Radeon Pro 5300 / 8GB RAM / macOS 26）验证跑通」的配方。
 #
-# 为什么用 Vulkan 而不是 Metal：Intel Mac 上官方 Ollama 只用 CPU、LM Studio 不支持 Intel Mac、
-# 而 stock llama.cpp 的 Metal 后端在「Intel+AMD」上被报输出损坏。Vulkan(经 MoltenVK) 是更可靠的 GPU 路径。
+# 关键结论（来自实测）：
+#  - 该硬件上 llama.cpp 的 **Metal 后端跑不了**：视觉段 SIGSEGV、语言段 GPU 看门狗超时。
+#  - **Vulkan（经 MoltenVK）可用**：语言模型上 GPU、视觉编码器留 CPU（--no-mmproj-offload）。
+#  - 依赖全部用 Homebrew 安装，**无需 LunarG 图形化 SDK**。
 #
-# 启动一个 OpenAI 兼容服务（默认 :8080），主服务把 .env 指过去即可（provider=openai）：
-#   OCR_PROVIDER=openai
-#   OCR_BASE_URL=http://127.0.0.1:8080/v1
-#   OCR_API_KEY=llama            # 任意非空
-#   OCR_MODEL=qwen2.5vl          # 任意；llama-server 用已加载的模型
-#
-# 兼容 macOS 自带 bash 3.2：不使用 nounset/数组。
+# 兼容 macOS bash 3.2：不使用 nounset/数组。
 set -eo pipefail
 cd "$(dirname "$0")"
 
-LLAMA_DIR="${LLAMA_DIR:-$PWD/llama.cpp}"
+export PATH=/usr/local/bin:$PATH
+LLAMA_DIR="${LLAMA_DIR:-$HOME/llama.cpp}"
+MODELS="${MODELS:-$HOME/models}"
 PORT="${PORT:-8080}"
-NGL="${NGL:-99}"                 # 尽量把所有层放到 GPU；显存不足可调小
-CTX="${CTX:-4096}"               # 4GB 显存偏小时可设 2048
-# 二选一的模型来源：
-#   1) HF_REPO：由 llama-server 自动从 HuggingFace 拉取 GGUF（含 mmproj，视觉模型会自动带上）
-#   2) MODEL_GGUF + MMPROJ_GGUF：使用本地已下载的权重
-HF_REPO="${HF_REPO:-ggml-org/Qwen2.5-VL-3B-Instruct-GGUF}"
-MODEL_GGUF="${MODEL_GGUF:-}"
-MMPROJ_GGUF="${MMPROJ_GGUF:-}"
+# 视觉模型 GGUF（含 mmproj）
+MODEL_FILE="${MODEL_FILE:-Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf}"
+MMPROJ_FILE="${MMPROJ_FILE:-mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf}"
+HF_BASE="https://huggingface.co/ggml-org/Qwen2.5-VL-3B-Instruct-GGUF/resolve/main"
+IMG_TOKENS="${IMG_TOKENS:-512}"   # 每张图像的视觉token（越大越准、越慢/越吃显存）
 
-# 1) 构建依赖
-command -v cmake >/dev/null 2>&1 || brew install cmake
-command -v git   >/dev/null 2>&1 || brew install git
+# 1) 依赖（cmake + Vulkan/MoltenVK 工具链，均来自 Homebrew）
+for f in cmake vulkan-loader vulkan-headers molten-vk shaderc vulkan-tools; do
+  brew list "$f" >/dev/null 2>&1 || brew install "$f"
+done
 
-# 2) Vulkan(MoltenVK) 环境：优先用已 source 的 VULKAN_SDK，否则尝试常见安装位置
-if [ -z "${VULKAN_SDK:-}" ]; then
-  for p in "$HOME/VulkanSDK"/*/setup-env.sh /usr/local/setup-env.sh; do
-    if [ -f "$p" ]; then
-      # shellcheck disable=SC1090
-      . "$p"
-      break
-    fi
-  done
-fi
-if [ -z "${VULKAN_SDK:-}" ]; then
-  echo "[Vulkan] 未检测到 Vulkan SDK。请先安装 LunarG macOS Vulkan SDK（含 MoltenVK）："
-  echo "         https://vulkan.lunarg.com/sdk/home#mac"
-  echo "         安装后在本终端执行： source <SDK目录>/setup-env.sh  再重跑本脚本。"
-  exit 1
-fi
-echo "[Vulkan] VULKAN_SDK=$VULKAN_SDK"
+ICD="$(/usr/bin/find /usr/local -iname MoltenVK_icd.json 2>/dev/null | head -1)"
+[ -n "$ICD" ] || ICD=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json
+export VK_ICD_FILENAMES="$ICD"
+export DYLD_LIBRARY_PATH=/usr/local/lib
 
-# 3) 拉取并构建 llama.cpp（Vulkan 后端，关闭 Metal）
-if [ ! -d "$LLAMA_DIR/.git" ]; then
-  echo "[Build] 克隆 llama.cpp …"
-  git clone https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
-elif [ "${SKIP_UPDATE:-0}" != "1" ]; then
-  echo "[Build] 更新 llama.cpp …"
-  (cd "$LLAMA_DIR" && git pull --ff-only) || echo "[Build] 更新跳过。"
-fi
-if [ ! -x "$LLAMA_DIR/build/bin/llama-server" ] || [ "${REBUILD:-0}" = "1" ]; then
-  echo "[Build] 编译 llama.cpp（Vulkan）… 首次较慢"
-  cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" -DGGML_VULKAN=1 -DGGML_METAL=OFF -DLLAMA_CURL=ON
-  cmake --build "$LLAMA_DIR/build" --config Release -j
+# 2) SDK 头修复：macOS 升级后 CLT 的 clang 默认找不到 SDK 里的 C++ 头，显式注入
+SDK="$(xcrun --show-sdk-path 2>/dev/null)"
+if [ -n "$SDK" ]; then
+  export CPLUS_INCLUDE_PATH="$SDK/usr/include/c++/v1"
+  export CPATH="$SDK/usr/include"
 fi
 
-SERVER="$LLAMA_DIR/build/bin/llama-server"
-[ -x "$SERVER" ] || { echo "[Build] 未找到 llama-server，构建可能失败。"; exit 1; }
-
-# 4) 启动 OpenAI 兼容服务
-echo "[Run] llama-server 监听 127.0.0.1:$PORT  ngl=$NGL ctx=$CTX"
-if [ -n "$MODEL_GGUF" ]; then
-  echo "[Run] 使用本地模型：$MODEL_GGUF  mmproj=${MMPROJ_GGUF:-<none>}"
-  if [ -n "$MMPROJ_GGUF" ]; then
-    exec "$SERVER" -m "$MODEL_GGUF" --mmproj "$MMPROJ_GGUF" -ngl "$NGL" -c "$CTX" --host 127.0.0.1 --port "$PORT"
-  else
-    exec "$SERVER" -m "$MODEL_GGUF" -ngl "$NGL" -c "$CTX" --host 127.0.0.1 --port "$PORT"
-  fi
-else
-  echo "[Run] 从 HuggingFace 拉取：$HF_REPO（视觉模型会自动带上 mmproj）"
-  exec "$SERVER" -hf "$HF_REPO" -ngl "$NGL" -c "$CTX" --host 127.0.0.1 --port "$PORT"
+# 3) 拉取并用 Vulkan 后端编译 llama.cpp（关闭 Metal；-j2 避免 8GB 机器 OOM 崩溃）
+[ -d "$LLAMA_DIR/.git" ] || git clone https://github.com/ggml-org/llama.cpp "$LLAMA_DIR"
+if [ ! -x "$LLAMA_DIR/build-vk/bin/llama-server" ] || [ "${REBUILD:-0}" = "1" ]; then
+  echo "[Build] 配置并编译 llama.cpp（Vulkan）… 首次很慢，-j2 防止内存打爆"
+  cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build-vk" -DGGML_VULKAN=1 -DGGML_METAL=OFF -DLLAMA_CURL=ON -DCMAKE_PREFIX_PATH=/usr/local
+  cmake --build "$LLAMA_DIR/build-vk" --config Release -j 2
 fi
+
+# 4) 下载模型（缺失时）
+mkdir -p "$MODELS"
+[ -f "$MODELS/$MODEL_FILE" ]  || curl -fL -o "$MODELS/$MODEL_FILE"  "$HF_BASE/$MODEL_FILE"
+[ -f "$MODELS/$MMPROJ_FILE" ] || curl -fL -o "$MODELS/$MMPROJ_FILE" "$HF_BASE/$MMPROJ_FILE"
+
+# 5) 启动 OpenAI 兼容服务
+#   --no-mmproj-offload：视觉编码器留 CPU（否则 Metal/MoltenVK 下 clip 会崩）
+#   -ub 256：小 ubatch，避免大命令缓冲触发 GPU 看门狗超时
+echo "[Run] llama-server(Vulkan) :$PORT  img_tokens=$IMG_TOKENS"
+exec "$LLAMA_DIR/build-vk/bin/llama-server" \
+  -m "$MODELS/$MODEL_FILE" --mmproj "$MODELS/$MMPROJ_FILE" \
+  -ngl 99 --no-mmproj-offload -c 4096 -b 512 -ub 256 \
+  --image-min-tokens "$IMG_TOKENS" --image-max-tokens "$IMG_TOKENS" --parallel 1 \
+  --host 127.0.0.1 --port "$PORT"
