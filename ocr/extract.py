@@ -40,6 +40,29 @@ def largest_amount(text: str) -> Optional[str]:
     return f"{max(vals):.2f}" if vals else None
 
 
+# 企业名后缀白名单（避免用裸「社/部」等造成误匹配，如「统一社会信用代码」）
+_COMPANY_RE = re.compile(
+    r"[\u4e00-\u9fa5（）()·]{2,}?"
+    r"(?:有限责任公司|股份有限公司|有限公司|分公司|公司|集团|厂|商行|商店|商贸|"
+    r"超市|酒店|饭店|宾馆|旅行社|事务所|合作社|研究院|研究所|学校|医院|银行股份|中心)"
+)
+# 命中这些词的候选一律丢弃（多为标签/字段名而非公司名）
+_COMPANY_BAD = ("代码", "信用", "识别", "账号", "开户", "地址", "电话", "税务", "社会")
+
+
+def _find_companies(full: str):
+    out = []
+    for c in _COMPANY_RE.findall(full):
+        c = c.strip()
+        if len(c) < 3:
+            continue
+        if any(b in c for b in _COMPANY_BAD):
+            continue
+        if c not in out:
+            out.append(c)
+    return out
+
+
 def extract_vat(full: str, joined: str) -> Dict[str, Any]:
     amount = None
     m = re.search(r"价税合计[\s\S]{0,20}?[（(]?\s*小写\s*[)）]?[\s\S]{0,6}?[¥￥]?\s*" + MONEY, full)
@@ -64,7 +87,7 @@ def extract_vat(full: str, joined: str) -> Dict[str, Any]:
         if mi:
             inv = mi.group(1)
 
-    companies = re.findall(r"([\u4e00-\u9fa5（）()]{2,}?(?:公司|厂|店|中心|部|社))", full)
+    companies = _find_companies(full)
     seller = companies[-1] if companies else None
     buyer = companies[0] if len(companies) >= 2 else None
 
