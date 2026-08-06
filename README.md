@@ -182,6 +182,11 @@ cd ocr && chmod +x start-ocr.sh && ./start-ocr.sh    # 自动选用 Python 3.12/
 
 字段抽取为基于 OCR 文本的规则匹配，不同版式可能需微调，详见 `ocr/README.md`。
 
+### 4.3 全本地方案 C：Intel + AMD 显卡 Mac 用 GPU 跑视觉模型（llama.cpp + Vulkan）
+
+若想用 AMD 独显加速、直接跑视觉大模型（识别更准，免规则调参），见 `deploy/llama-macos/README.md`：
+用 **llama.cpp + Vulkan(MoltenVK)** 起一个 OpenAI 兼容服务，`.env` 设 `OCR_PROVIDER=openai` + `OCR_BASE_URL=http://127.0.0.1:8080/v1` 即可。属实验性方案（4GB 显存偏小、需装 Vulkan SDK），请先小规模验证。
+
 ## 5. 支持的票种
 
 由通义千问 VL（默认 `qwen-vl-max`）**一次调用**识别票种并抽取字段：
