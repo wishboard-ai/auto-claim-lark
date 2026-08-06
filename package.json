@@ -22,12 +22,12 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.71.1",
-    "dotenv": "^16.4.7"
+    "@larksuiteoapi/node-sdk": "^1.72.0",
+    "dotenv": "^17.4.2"
   },
   "devDependencies": {
-    "@types/node": "^22.10.5",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "@types/node": "^26.1.2",
+    "tsx": "^4.23.7",
+    "typescript": "^7.0.2"
   }
 }

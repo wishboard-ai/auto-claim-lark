@@ -24,13 +24,55 @@ _ocr = None
 
 
 def get_ocr():
-    """延迟初始化 PaddleOCR（首次请求时加载模型）。"""
+    """延迟初始化 PaddleOCR（首次请求时加载模型）。兼容不同版本的构造参数。"""
     global _ocr
     if _ocr is None:
         from paddleocr import PaddleOCR
-        _ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+        # 不同版本构造参数不同（2.x 有 use_angle_cls/show_log；3.x 改名/移除），逐个尝试。
+        last_err = None
+        for kwargs in ({"lang": "ch"}, {"use_angle_cls": True, "lang": "ch"}, {}):
+            try:
+                _ocr = PaddleOCR(**kwargs)
+                break
+            except TypeError as e:
+                last_err = e
+                continue
+        if _ocr is None:
+            raise last_err or RuntimeError("无法初始化 PaddleOCR")
         log.info("PaddleOCR 模型已加载")
     return _ocr
+
+
+def _lines_from_result(result) -> List[str]:
+    """兼容 PaddleOCR 2.x（[[ [box,(text,score)], ... ]]）与 3.x（含 rec_texts 的结构）。"""
+    lines: List[str] = []
+    if not result:
+        return lines
+    for res in result:
+        # 3.x：OCRResult，通常可通过 ['rec_texts'] 或 .json 取到文本列表
+        rec_texts = None
+        if isinstance(res, dict):
+            rec_texts = res.get("rec_texts")
+        else:
+            rec_texts = getattr(res, "rec_texts", None)
+            if rec_texts is None:
+                try:
+                    rec_texts = res["rec_texts"]  # 支持 dict-like
+                except Exception:
+                    rec_texts = None
+        if rec_texts:
+            lines.extend(str(t).strip() for t in rec_texts if str(t).strip())
+            continue
+        # 2.x：res 是该图的行列表，每行 [box, (text, score)]
+        if isinstance(res, list):
+            for item in res:
+                try:
+                    txt = item[1][0]
+                    if txt and str(txt).strip():
+                        lines.append(str(txt).strip())
+                except Exception:
+                    continue
+    return lines
 
 
 def run_ocr(image_bytes: bytes) -> List[str]:
@@ -40,17 +82,20 @@ def run_ocr(image_bytes: bytes) -> List[str]:
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("无法解码图片")
-    result = get_ocr().ocr(img, cls=True)
-    lines: List[str] = []
-    blocks = result[0] if result and isinstance(result, list) and result[0] else []
-    for item in blocks or []:
+    ocr = get_ocr()
+    result = None
+    # 3.x 优先 predict；2.x 用 ocr()（新版不接受 cls 参数）
+    if hasattr(ocr, "predict"):
         try:
-            txt = item[1][0]
-            if txt and str(txt).strip():
-                lines.append(str(txt).strip())
+            result = ocr.predict(img)
         except Exception:
-            continue
-    return lines
+            result = None
+    if result is None:
+        try:
+            result = ocr.ocr(img)
+        except TypeError:
+            result = ocr.ocr(img, cls=True)
+    return _lines_from_result(result)
 
 
 @app.get("/health")

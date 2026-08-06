@@ -106,7 +106,7 @@ npm run inspect:approval
 
 ## 4. 运行
 
-**一键启动（Windows，推荐）**：双击项目根目录的 `start.bat`。它会自动安装依赖、编译并以常驻方式运行（`node dist`），关闭窗口即停止。
+**一键启动（Windows，推荐）**：双击项目根目录的 `start.bat`。它会**检查更新（git pull）→ 安装/更新依赖 → 编译 → 常驻运行**（`node dist`），关闭窗口即停止。设环境变量 `SKIP_UPDATE=1` 可跳过更新检查。
 
 命令行方式：
 
@@ -116,6 +116,8 @@ npm run dev                  # 开发模式（tsx watch 热重载，仅供开发
 ```
 
 > 注意：`npm run dev` 使用 `tsx watch` 热重载，适合改代码时用；直接「双击运行」请用 `start.bat` 或 `npm start`，避免 watch 模式在非交互窗口下退出。
+>
+> **自更新**：`start.sh` / `start.bat` 每次启动都会 `git pull --ff-only` 拉取最新代码并重装依赖、重新编译；离线或有本地改动时会自动跳过、沿用当前代码。
 
 启动后在飞书里单聊机器人、发送一张发票图片即可。
 
@@ -145,13 +147,17 @@ cp .env.example .env
 chmod +x start.sh && ./start.sh   # 一键：装依赖→编译→（必要时拉起 ollama）→运行
 ```
 
-**常驻 / 开机自启**：用 `deploy/com.autoclaim.lark.plist`（launchd）。改好其中 `{{NODE_PATH}}`（`which node`）与 `{{PROJECT_DIR}}` 两处后：
+**常驻 / 开机自启（含每次启动检查更新）**：用 `deploy/com.autoclaim.lark.plist`（launchd）。它经 `start.sh` 启动，因此每次开机/重启都会自动 `git pull` + 装依赖 + 编译再运行。改好其中 `{{PROJECT_DIR}}` 与 `PATH`（Apple Silicon 用 `/opt/homebrew/bin`，Intel Mac 用 `/usr/local/bin`）后：
 
 ```bash
+mkdir -p logs && chmod +x start.sh
 cp deploy/com.autoclaim.lark.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.autoclaim.lark.plist   # 启动并开机自启
 # 停止： launchctl unload ~/Library/LaunchAgents/com.autoclaim.lark.plist
 ```
+
+> 若用 PaddleOCR 全本地方案，OCR 是独立进程，另用 `deploy/com.autoclaim.ocr.plist` 让它一起开机自启。
+> 想临时关闭「启动时检查更新」，把 plist 里 `SKIP_UPDATE` 设为 `1`（或运行时 `SKIP_UPDATE=1 ./start.sh`）。
 
 > Intel 款 iMac（无 Apple Silicon）跑本地视觉模型较慢，建议改用下面的 **PaddleOCR 全本地方案**。
 
@@ -213,7 +219,8 @@ ocr/                       本地 PaddleOCR 微服务（OCR_PROVIDER=paddle 时�
   requirements.txt         Python 依赖
   start-ocr.sh             一键启动（建 venv、装依赖、跑服务）
 deploy/
-  com.autoclaim.lark.plist macOS launchd 常驻/开机自启模板
+  com.autoclaim.lark.plist  机器人：macOS launchd 常驻/开机自启（经 start.sh，含自更新）
+  com.autoclaim.ocr.plist   PaddleOCR 服务：launchd 常驻/开机自启（经 ocr/start-ocr.sh）
 ```
 
 ## 备注

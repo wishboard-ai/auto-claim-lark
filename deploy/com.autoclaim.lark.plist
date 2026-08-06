@@ -1,48 +1,62 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   macOS 开机自启 / 常驻守护配置（launchd）。
+  经 start.sh 启动 => 每次开机/重启都会「检查更新」(git pull + 装依赖 + 编译) 再运行。
+
   部署步骤（在苹果一体机上）：
-    1. 把本项目放到某个目录，例如 /Users/<你>/apps/auto-claim-lark
-    2. 编译一次： npm install && npm run build
-    3. 修改下方两处占位：
-       - {{NODE_PATH}}   → 执行 `which node` 的输出，例如 /opt/homebrew/bin/node
+    1. 把项目放到某目录，例如 /Users/<你>/apps/auto-claim-lark，并 git clone / 配好 .env
+    2. 首次编译一次： npm install && npm run build
+    3. 给脚本可执行权限： chmod +x start.sh
+    4. 修改下方占位：
        - {{PROJECT_DIR}} → 项目绝对路径，例如 /Users/你/apps/auto-claim-lark
-    4. 拷贝到用户级 LaunchAgents 并加载：
+       - PATH 中的 node/git/npm 路径：Apple Silicon 用 /opt/homebrew/bin；Intel Mac 用 /usr/local/bin
+    5. 拷贝并加载：
          cp deploy/com.autoclaim.lark.plist ~/Library/LaunchAgents/
          launchctl load  ~/Library/LaunchAgents/com.autoclaim.lark.plist   # 启动+开机自启
          launchctl unload ~/Library/LaunchAgents/com.autoclaim.lark.plist  # 停止
   日志见 {{PROJECT_DIR}}/logs/ 下的 out.log / err.log
+  如需临时禁用「启动时检查更新」，把下方 EnvironmentVariables 里的 SKIP_UPDATE 改为 1。
+
+  注意：本机器人（发票识别 + 审批）与本地 PaddleOCR 服务是两个进程。
+  若用 PaddleOCR 全本地方案，另建一份 launchd 让 ocr/start-ocr.sh 也开机自启。
 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
   <string>com.autoclaim.lark</string>
 
+  <!-- 经 start.sh 启动：git pull -> npm install -> build -> node -->
   <key>ProgramArguments</key>
   <array>
-    <string>{{NODE_PATH}}</string>
-    <string>{{PROJECT_DIR}}/dist/src/index.js</string>
+    <string>/bin/bash</string>
+    <string>{{PROJECT_DIR}}/start.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
   <string>{{PROJECT_DIR}}</string>
 
-  <!-- 崩溃/退出后自动拉起，实现常驻 -->
+  <!-- 崩溃/退出后自动拉起，实现常驻；开机自动运行 -->
   <key>KeepAlive</key>
   <true/>
   <key>RunAtLoad</key>
   <true/>
+  <!-- 崩溃重启最小间隔，避免更新检查在异常时高频重跑 -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
 
   <key>StandardOutPath</key>
   <string>{{PROJECT_DIR}}/logs/out.log</string>
   <key>StandardErrorPath</key>
   <string>{{PROJECT_DIR}}/logs/err.log</string>
 
-  <!-- 确保能找到 ollama（Homebrew 路径）；如用 Intel Mac 改为 /usr/local/bin -->
   <key>EnvironmentVariables</key>
   <dict>
+    <!-- 确保能找到 node/git/npm/ollama：Apple Silicon /opt/homebrew/bin；Intel Mac /usr/local/bin -->
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <!-- 设为 1 可关闭「启动时检查更新」 -->
+    <key>SKIP_UPDATE</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

@@ -1,7 +1,8 @@
 import * as dotenv from 'dotenv';
 import * as lark from '@larksuiteoapi/node-sdk';
 
-dotenv.config();
+// quiet: 关闭 dotenv v17 默认打印的加载提示横幅
+dotenv.config({ quiet: true });
 
 function req(name: string): string {
   const v = process.env[name];

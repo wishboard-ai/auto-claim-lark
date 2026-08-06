@@ -6,6 +6,12 @@ cd "$(dirname "$0")"
 
 PY="${PYTHON:-python3}"
 
+# 启动时检查更新（拉取最新代码；SKIP_UPDATE=1 可跳过）
+if [ "${SKIP_UPDATE:-0}" != "1" ] && command -v git >/dev/null 2>&1 && [ -d ../.git ]; then
+  echo "[更新] git pull --ff-only …"
+  (cd .. && git pull --ff-only) || echo "[更新] 跳过（离线/有本地改动/非快进）。"
+fi
+
 if [ ! -d .venv ]; then
   echo "[1/3] 创建虚拟环境 .venv …"
   "$PY" -m venv .venv

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  本地 PaddleOCR 服务的开机自启 / 常驻配置（launchd）。仅在使用 OCR_PROVIDER=paddle 全本地方案时需要。
+  经 ocr/start-ocr.sh 启动 => 每次启动会 git pull + 装/更新依赖 + 跑服务（http://127.0.0.1:8000）。
+
+  步骤：
+    1. 改 {{PROJECT_DIR}} 为项目绝对路径；PATH 按芯片选 /opt/homebrew/bin（Apple Silicon）或 /usr/local/bin（Intel）。
+    2. cp deploy/com.autoclaim.ocr.plist ~/Library/LaunchAgents/
+       launchctl load  ~/Library/LaunchAgents/com.autoclaim.ocr.plist
+       launchctl unload ~/Library/LaunchAgents/com.autoclaim.ocr.plist   # 停止
+  日志见 {{PROJECT_DIR}}/ocr/logs 下 out.log / err.log
+  Python 需 3.10/3.11 时，可在 EnvironmentVariables 增加 PYTHON=python3.11。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.autoclaim.ocr</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{{PROJECT_DIR}}/ocr/start-ocr.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{PROJECT_DIR}}/ocr</string>
+
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>{{PROJECT_DIR}}/ocr/logs/out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{PROJECT_DIR}}/ocr/logs/err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>SKIP_UPDATE</key>
+    <string>0</string>
+  </dict>
+</dict>
+</plist>
