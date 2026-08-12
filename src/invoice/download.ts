@@ -10,9 +10,30 @@ export async function downloadImage(
   messageId: string,
   imageKey: string
 ): Promise<Buffer> {
+  return downloadMessageResource(client, messageId, imageKey, 'image');
+}
+
+/**
+ * 下载消息中的文件资源（如 PDF）为 Buffer。文件消息用 file_key，type 传 'file'。
+ */
+export async function downloadFile(
+  client: lark.Client,
+  messageId: string,
+  fileKey: string
+): Promise<Buffer> {
+  return downloadMessageResource(client, messageId, fileKey, 'file');
+}
+
+/** 通用：按资源类型（image/file）下载消息内的资源为 Buffer。 */
+async function downloadMessageResource(
+  client: lark.Client,
+  messageId: string,
+  fileKey: string,
+  type: 'image' | 'file'
+): Promise<Buffer> {
   const resp = await client.im.v1.messageResource.get({
-    path: { message_id: messageId, file_key: imageKey },
-    params: { type: 'image' },
+    path: { message_id: messageId, file_key: fileKey },
+    params: { type },
   });
   return streamToBuffer(resp.getReadableStream());
 }

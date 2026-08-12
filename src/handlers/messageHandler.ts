@@ -2,8 +2,9 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import { AppConfig } from '../config';
 import { logger } from '../logger';
 import { RecognizedInvoice } from '../types';
-import { downloadImage } from '../invoice/download';
-import { recognizeInvoice, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
+import { downloadImage, downloadFile } from '../invoice/download';
+import { pdfFirstPageToImage, extractPdfText, hasUsableText, isPdf } from '../invoice/pdf';
+import { recognizeInvoice, recognizeInvoiceFromText, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
 import { buildApprovalForm, FormOverrides } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
 import { addItem, getPending, clearPending, CartItem } from './session';
@@ -15,7 +16,7 @@ const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '
 const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
 
 const HELP_TEXT =
-  '你好，我是发票报销助手 🧾\n发送发票图片（增值税发票 / 火车票 / 出租车票），可连续发送多张累加到同一张报销单；\n发完后直接回复本次「报销事由」即可提交（例如：1月客户拜访交通费），或回复「取消」放弃。';
+  '你好，我是发票报销助手 🧾\n发送发票图片或 PDF（增值税发票 / 火车票 / 出租车票），可连续发送多张累加到同一张报销单；\n发完后直接回复本次「报销事由」即可提交（例如：1月客户拜访交通费），或回复「取消」放弃。';
 
 export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   // 幂等去重
@@ -102,35 +103,117 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     logger.info(`收到图片消息（messageId=${messageId}），开始下载…`);
     const buffer = await downloadImage(client, messageId, imageKey);
     logger.info(`图片已下载：${buffer.length} 字节`);
-    let invoice: RecognizedInvoice;
+    await recognizeAndCollect(chatId, openId, buffer);
+  }
+
+  async function handleFile(
+    chatId: string,
+    openId: string | undefined,
+    messageId: string,
+    content: string
+  ): Promise<void> {
+    const meta = JSON.parse(content) as { file_key?: string; file_name?: string };
+    const fileName = meta.file_name || '';
+    if (!meta.file_key) return;
+    const isPdfName = /\.pdf$/i.test(fileName);
+    logger.info(`收到文件消息（messageId=${messageId}, name=${fileName}），开始下载…`);
+    const fileBuf = await downloadFile(client, messageId, meta.file_key);
+    logger.info(`文件已下载：${fileBuf.length} 字节`);
+
+    if (!isPdfName && !isPdf(fileBuf)) {
+      await sendText(chatId, '暂不支持该文件类型。请发送发票图片，或 PDF 格式的电子发票。');
+      return;
+    }
+
+    // 优先读取 PDF 文字层：文本型 PDF 直接按文本识别（更快/更省/更准，无需栅格化）。
+    const pdfText = await extractPdfText(fileBuf);
+    let invoice: RecognizedInvoice | null;
+    let attachImage: Buffer | undefined;
+
+    if (hasUsableText(pdfText)) {
+      logger.info(`PDF 含文字层（${pdfText.replace(/\s+/g, '').length} 字），按文本识别…`);
+      invoice = await recognizeGuarded(chatId, () => recognizeInvoiceFromText(cfg, pdfText));
+      if (!invoice) return;
+      // 附件图片为可选：本地栅格化首页用于审批「图片」控件（无 API 成本，失败不阻断）。
+      attachImage = await pdfFirstPageToImage(fileBuf).catch((e) => {
+        logger.warn('PDF 栅格化（附件用）失败，跳过附件：', (e as Error).message);
+        return undefined;
+      });
+    } else {
+      // 无文字层（扫描件/图片型 PDF）→ 栅格化首页走视觉识别。
+      logger.info('PDF 无可用文字层，栅格化首页后走视觉识别…');
+      let imageBuf: Buffer;
+      try {
+        imageBuf = await pdfFirstPageToImage(fileBuf);
+        logger.info(`PDF 已转为图片：${imageBuf.length} 字节`);
+      } catch (e) {
+        logger.error('PDF 转图片失败', e);
+        await sendText(chatId, `PDF 解析失败：${(e as Error).message}\n可尝试改发发票截图/图片。`);
+        return;
+      }
+      invoice = await recognizeGuarded(chatId, () => recognizeInvoice(cfg, imageBuf));
+      if (!invoice) return;
+      attachImage = imageBuf;
+    }
+
+    await finalizeInvoice(chatId, openId, invoice, attachImage);
+  }
+
+  /** 识别一张发票图片并按模式加入报销单 / 直接创建（图片消息用）。 */
+  async function recognizeAndCollect(
+    chatId: string,
+    openId: string | undefined,
+    buffer: Buffer
+  ): Promise<void> {
+    const invoice = await recognizeGuarded(chatId, () => recognizeInvoice(cfg, buffer));
+    if (!invoice) return;
+    await finalizeInvoice(chatId, openId, invoice, buffer);
+  }
+
+  /** 执行识别并处理额度/未配置类错误（已处理则回复并返回 null，交由上层中止）。 */
+  async function recognizeGuarded(
+    chatId: string,
+    recognize: () => Promise<RecognizedInvoice>
+  ): Promise<RecognizedInvoice | null> {
     try {
-      invoice = await recognizeInvoice(cfg, buffer);
+      return await recognize();
     } catch (e) {
       if (e instanceof QuotaExceededError) {
         await sendText(
           chatId,
           '发票识别额度已用尽或账户欠费，暂时无法识别 😥\n请联系管理员在阿里云百炼（DashScope）控制台确认 qwen-vl-ocr 的额度 / 账户余额后再试。'
         );
-        return;
+        return null;
       }
       if (e instanceof OcrNotConfiguredError) {
         await sendText(
           chatId,
           '尚未配置发票识别服务。请在 .env 中填写百炼 API Key（LLM_API_KEY，或单独的 OCR_API_KEY）后重启服务。'
         );
-        return;
+        return null;
       }
       throw e;
     }
+  }
+
+  /** 识别结果落地：校验 → 按模式加入报销单或直接创建。imageBuffer 用于审批附件（可选）。 */
+  async function finalizeInvoice(
+    chatId: string,
+    openId: string | undefined,
+    invoice: RecognizedInvoice,
+    imageBuffer?: Buffer
+  ): Promise<void> {
     if (invoice.type === 'unknown') {
-      await sendText(chatId, '未能识别该图片中的发票信息，请确认是清晰的增值税发票 / 火车票 / 出租车票图片。');
+      await sendText(chatId, '未能识别其中的发票信息，请确认是清晰的增值税发票 / 火车票 / 出租车票（图片或 PDF）。');
       return;
     }
     if (!openId) {
       await sendText(chatId, '无法获取你的用户身份（open_id），无法发起审批。');
       return;
     }
-    const item: CartItem = { invoice, imageBuffer: buffer, imageExt: imgExt(buffer) };
+    const item: CartItem = imageBuffer
+      ? { invoice, imageBuffer, imageExt: imgExt(imageBuffer) }
+      : { invoice };
     if (cfg.submitMode === 'direct') {
       await createFromItems(chatId, openId, [item], '');
     } else {
@@ -199,10 +282,12 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       try {
         if (msgType === 'image') {
           await handleImage(chatId, openId, messageId, message.content);
+        } else if (msgType === 'file') {
+          await handleFile(chatId, openId, messageId, message.content);
         } else if (msgType === 'text') {
           await handleText(chatId, openId, message.content);
         } else {
-          await sendText(chatId, '请发送发票图片（增值税发票 / 火车票 / 出租车票）。');
+          await sendText(chatId, '请发送发票图片或 PDF（增值税发票 / 火车票 / 出租车票）。');
         }
       } catch (e) {
         logger.error('处理消息出错', e);

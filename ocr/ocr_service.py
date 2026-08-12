@@ -121,6 +121,33 @@ async def recognize_endpoint(request: Request):
         return JSONResponse({"type": "unknown", "error": str(e)}, status_code=500)
 
 
+@app.post("/recognize_text")
+async def recognize_text_endpoint(request: Request):
+    """文本型 PDF：直接对已提取的文字层做规则抽取，无需 OCR。
+    接受 JSON {"text": "..."} 或原始文本 body。"""
+    body = await request.body()
+    if not body:
+        return JSONResponse({"type": "unknown", "error": "empty body"}, status_code=400)
+    text = ""
+    try:
+        import json
+        data = json.loads(body)
+        text = data.get("text", "") if isinstance(data, dict) else str(data)
+    except Exception:
+        text = body.decode("utf-8", errors="ignore")
+    try:
+        lines = [ln for ln in text.splitlines()]
+        result = extract.structure(lines)
+        log.info(
+            "文本识别结果 type=%s amount=%s date=%s",
+            result.get("type"), result.get("amount"), result.get("date"),
+        )
+        return result
+    except Exception as e:  # noqa
+        log.exception("文本识别失败")
+        return JSONResponse({"type": "unknown", "error": str(e)}, status_code=500)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)

@@ -128,9 +128,9 @@ function normalizeRaw(parsed: Record<string, unknown>): Record<string, string> {
 
 // ============ provider: openai（多模态大模型） ============
 
-const EXTRACT_PROMPT =
-  '你是发票识别助手。请识别图片中的票据类型并抽取关键字段，只返回一个严格的 JSON 对象，' +
-  '不要输出任何解释、Markdown 代码块或多余文字。字段说明：\n' +
+// 字段抽取规则（图片识别与文本识别共用）。「图片/票面」措辞用占位符 {SRC} 适配两种输入。
+const FIELD_SPEC =
+  '字段说明：\n' +
   '- type: 票种，取值 "vat"(增值税发票/电子发票/普票专票)、"train"(火车票)、"taxi"(出租车票/网约车行程单)，无法判断填 "unknown"。\n' +
   '  判定要点：只要票面具备增值税发票要素（有「价税合计」「纳税人识别号」「销售方/购买方」等），' +
   '即使服务内容是客运/出租车/网约车（如滴滴电子发票），也应归为 "vat"；' +
@@ -139,16 +139,28 @@ const EXTRACT_PROMPT =
   '  · 增值税发票/电子发票：取「价税合计」（即「价税合计（小写）」后的金额，等于 合计金额 + 合计税额），' +
   '严禁取「金额」列或不含税的「合计」小计（那是税前金额，通常比价税合计小）；\n' +
   '  · 火车票/出租车/网约车：取实付总额（含税）；\n' +
-  '  · 若图中同时出现「金额/合计（不含税）」与「价税合计（含税）」两个数，一律取较大的价税合计；\n' +
+  '  · 若同时出现「金额/合计（不含税）」与「价税合计（含税）」两个数，一律取较大的价税合计；\n' +
   '- date: 开票/乘车日期，格式 YYYY-MM-DD；\n' +
   '- sellerName: 销售方/商家/承运方名称；\n' +
   '- buyerName: 购买方名称（无则留空）；\n' +
   '- invoiceNo: 发票号码/票号；\n' +
   '- taxAmount: 税额（元，仅增值税发票，只要数字，无则留空）；\n' +
   '- summary: 摘要（如 出发站→到达站、车次、里程、时间等，无则留空）。\n' +
-  '严禁编造图片中不存在的信息，找不到的字段填空字符串。\n' +
+  '严禁编造{SRC}中不存在的信息，找不到的字段填空字符串。\n' +
   '返回示例：{"type":"train","amount":"553.5","date":"2024-01-15","sellerName":"中国铁路",' +
   '"buyerName":"","invoiceNo":"E123456789","taxAmount":"","summary":"北京南→上海虹桥 G1 二等座"}';
+
+const EXTRACT_PROMPT =
+  '你是发票识别助手。请识别图片中的票据类型并抽取关键字段，只返回一个严格的 JSON 对象，' +
+  '不要输出任何解释、Markdown 代码块或多余文字。' +
+  FIELD_SPEC.replace(/\{SRC\}/g, '图片');
+
+// 文本型 PDF：直接把 PDF 文字层内容交给文本模型抽取（无需栅格化/视觉）。
+const EXTRACT_PROMPT_TEXT =
+  '你是发票识别助手。下面是从一张发票 PDF 中提取的文字层内容（可能顺序错乱、含多余换行/空格），' +
+  '请据此判断票据类型并抽取关键字段，只返回一个严格的 JSON 对象，' +
+  '不要输出任何解释、Markdown 代码块或多余文字。' +
+  FIELD_SPEC.replace(/\{SRC\}/g, '文本');
 
 function isQuotaOrBillingError(status: number, bodyText: string): boolean {
   if (status === 429) return true;
@@ -237,23 +249,32 @@ async function pullOllamaModel(baseUrl: string, model: string): Promise<void> {
 
 async function recognizeViaOpenAI(cfg: AppConfig, file: Buffer): Promise<RecognizedInvoice> {
   const { ocr } = cfg;
-  if (!ocr.apiKey) throw new OcrNotConfiguredError();
-
   const dataUri = `data:${mimeForImage(file)};base64,${file.toString('base64')}`;
-  const url = `${ocr.baseUrl.replace(/\/$/, '')}/chat/completions`;
   logger.info(`调用 OCR 识别（provider=openai, model=${ocr.model}, 图片 ${file.length} 字节）…`);
+  return openAIChatToInvoice(cfg, [
+    { type: 'image_url', image_url: { url: dataUri } },
+    { type: 'text', text: EXTRACT_PROMPT },
+  ]);
+}
+
+/** 文本型 PDF：把提取到的文字层交给文本模型抽取（openai provider）。 */
+async function recognizeTextViaOpenAI(cfg: AppConfig, text: string): Promise<RecognizedInvoice> {
+  const { ocr } = cfg;
+  logger.info(`调用文本识别（provider=openai, model=${ocr.model}, 文本 ${text.length} 字）…`);
+  return openAIChatToInvoice(cfg, [
+    { type: 'text', text: `${EXTRACT_PROMPT_TEXT}\n\n===== 发票文本 =====\n${text}` },
+  ]);
+}
+
+/** 发送 OpenAI 兼容 chat/completions（图片或纯文本），解析返回为 RecognizedInvoice。 */
+async function openAIChatToInvoice(cfg: AppConfig, content: unknown): Promise<RecognizedInvoice> {
+  const { ocr } = cfg;
+  if (!ocr.apiKey) throw new OcrNotConfiguredError();
+  const url = `${ocr.baseUrl.replace(/\/$/, '')}/chat/completions`;
 
   const body = JSON.stringify({
     model: ocr.model,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          { type: 'image_url', image_url: { url: dataUri } },
-          { type: 'text', text: EXTRACT_PROMPT },
-        ],
-      },
-    ],
+    messages: [{ role: 'user', content }],
     temperature: 0,
   });
   const postChat = () =>
@@ -343,6 +364,35 @@ async function recognizeViaPaddle(cfg: AppConfig, file: Buffer): Promise<Recogni
   return buildFromParsed(parsed);
 }
 
+/** 文本型 PDF：把文字层交给本地 PaddleOCR 服务的 /recognize_text（复用其规则抽取，免栅格化）。 */
+async function recognizeTextViaPaddle(cfg: AppConfig, text: string): Promise<RecognizedInvoice> {
+  const { ocr } = cfg;
+  const url = `${ocr.baseUrl.replace(/\/$/, '')}/recognize_text`;
+  logger.info(`调用文本识别（provider=paddle, ${url}, 文本 ${text.length} 字）…`);
+
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+  } catch (e) {
+    logger.warn('本地 PaddleOCR 服务连接失败：', (e as Error).message);
+    throw new Error(
+      `无法连接本地 OCR 服务 ${ocr.baseUrl}。请先启动 PaddleOCR 服务（见 ocr/README.md）。`
+    );
+  }
+  if (!resp.ok) {
+    const bodyText = await resp.text().catch(() => '');
+    logger.warn(`本地 PaddleOCR /recognize_text HTTP ${resp.status}：${bodyText.slice(0, 300)}`);
+    throw new Error(`本地 OCR 服务错误 HTTP ${resp.status}`);
+  }
+  const parsed: any = await resp.json().catch(() => null);
+  if (!parsed || typeof parsed !== 'object') return { type: 'unknown', typeLabel: '未知票据', raw: {} };
+  return buildFromParsed(parsed);
+}
+
 // ============ 分发入口 ============
 
 /**
@@ -353,4 +403,14 @@ export async function recognizeInvoice(cfg: AppConfig, file: Buffer): Promise<Re
   if (!ocr.enabled) throw new OcrNotConfiguredError();
   if (ocr.provider === 'paddle') return recognizeViaPaddle(cfg, file);
   return recognizeViaOpenAI(cfg, file);
+}
+
+/**
+ * 从文本识别发票（用于文本型 PDF 的文字层）。按 OCR_PROVIDER 选择后端。
+ */
+export async function recognizeInvoiceFromText(cfg: AppConfig, text: string): Promise<RecognizedInvoice> {
+  const { ocr } = cfg;
+  if (!ocr.enabled) throw new OcrNotConfiguredError();
+  if (ocr.provider === 'paddle') return recognizeTextViaPaddle(cfg, text);
+  return recognizeTextViaOpenAI(cfg, text);
 }
