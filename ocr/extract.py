@@ -7,6 +7,11 @@ from typing import Optional, List, Dict, Any
 
 MONEY = r"([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{1,2}|[0-9]+\.[0-9]{1,2})"
 
+# 「价税合计」「小写」在 OCR/PDF 中常被拆成带空格的单字（如「价 税 合 计」「（ 小 写 ）」），
+# 用允许字符间空白的模式匹配，避免漏识别导致回退到税前「金额」。
+VAT_TOTAL_LABEL = r"价\s*税\s*合\s*计"
+XIAOXIE = r"小\s*写"
+
 TAXI_KW = ["出租车", "出租汽车", "TAXI", "taxi", "里程", "燃油附加", "叫车", "网约车"]
 TRAIN_KW = ["铁路电子", "火车票", "中国铁路", "12306", "始发站", "到达站"]
 VAT_KW = ["增值税", "发票代码", "价税合计", "销售方", "购买方", "纳税人识别号", "税额"]
@@ -65,9 +70,9 @@ def _find_companies(full: str):
 
 def extract_vat(full: str, joined: str) -> Dict[str, Any]:
     amount = None
-    m = re.search(r"价税合计[\s\S]{0,20}?[（(]?\s*小写\s*[)）]?[\s\S]{0,6}?[¥￥]?\s*" + MONEY, full)
+    m = re.search(VAT_TOTAL_LABEL + r"[\s\S]{0,20}?[（(]?\s*" + XIAOXIE + r"\s*[)）]?[\s\S]{0,6}?[¥￥]?\s*" + MONEY, full)
     if not m:
-        m = re.search(r"价税合计[\s\S]{0,20}?[¥￥]\s*" + MONEY, full)
+        m = re.search(VAT_TOTAL_LABEL + r"[\s\S]{0,20}?[¥￥]\s*" + MONEY, full)
     if m:
         amount = clean_amount(m.group(1))
     if not amount:
@@ -138,10 +143,18 @@ def extract_train(full: str, joined: str) -> Dict[str, Any]:
 
 def extract_taxi(full: str, joined: str) -> Dict[str, Any]:
     amount = None
-    ma = re.search(r"金\s*额[\s\S]{0,6}?[¥￥]?\s*" + MONEY, full)
-    if ma:
-        amount = clean_amount(ma.group(1))
-    else:
+    # 优先取「价税合计（含税总额）」——部分网约车/客运电子发票同时有不含税「金额」列，
+    # 若误取「金额」会得到税前金额（偏小）。价税合计才是报销总额。
+    mv = re.search(VAT_TOTAL_LABEL + r"[\s\S]{0,20}?[（(]?\s*" + XIAOXIE + r"\s*[)）]?[\s\S]{0,6}?[¥￥]?\s*" + MONEY, full)
+    if not mv:
+        mv = re.search(VAT_TOTAL_LABEL + r"[\s\S]{0,20}?[¥￥]\s*" + MONEY, full)
+    if mv:
+        amount = clean_amount(mv.group(1))
+    if not amount:
+        ma = re.search(r"金\s*额[\s\S]{0,6}?[¥￥]?\s*" + MONEY, full)
+        if ma:
+            amount = clean_amount(ma.group(1))
+    if not amount:
         amount = largest_amount(full)
 
     inv = None
@@ -164,11 +177,16 @@ def extract_taxi(full: str, joined: str) -> Dict[str, Any]:
     }
 
 
-def classify(joined: str) -> str:
-    if any(k in joined for k in TAXI_KW):
-        return "taxi"
+def classify(joined: str, full: str = "") -> str:
+    # 铁路车票优先（其票面元素与增值税发票有重叠，靠强关键词区分）
     if any(k in joined for k in TRAIN_KW) or re.search(r"[GDCZTKL]\d{1,4}.*站", joined):
         return "train"
+    # 具备增值税发票要素（价税合计 / 纳税人识别号）的一律归为 vat——
+    # 即使服务内容是客运/出租车/网约车（如滴滴电子发票）。
+    if re.search(VAT_TOTAL_LABEL, full) or "纳税人识别号" in joined:
+        return "vat"
+    if any(k in joined for k in TAXI_KW):
+        return "taxi"
     if any(k in joined for k in VAT_KW):
         return "vat"
     return "unknown"
@@ -181,7 +199,7 @@ def structure(lines: List[str]) -> Dict[str, Any]:
     if not joined:
         return {"type": "unknown", "raw_text": ""}
 
-    kind = classify(joined)
+    kind = classify(joined, full)
     if kind == "vat":
         out = extract_vat(full, joined)
     elif kind == "train":
