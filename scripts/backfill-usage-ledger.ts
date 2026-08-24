@@ -154,6 +154,7 @@ async function main(): Promise<void> {
     dupSkip: 0,
     inScope: 0,
     totalUrls: 0,
+    nonInvoice: 0,
   };
 
   console.log(
@@ -191,7 +192,8 @@ async function main(): Promise<void> {
           const buf = await download(url, cfg);
           const inv = await recognizeBuffer(cfg, buf);
           if (inv.type === 'unknown') {
-            report.recogFail++;
+            report.nonInvoice++;
+            console.log(`    [跳过·非发票/未知] ${code}（如支付截图等，不入台账）`);
             continue;
           }
           const fp = invoiceFingerprint(inv);
@@ -233,7 +235,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log(`识别失败/未知票种：${report.recogFail}`);
+  console.log(`非发票/未知票种（已跳过，如支付截图）：${report.nonInvoice}`);
+  console.log(`下载/识别失败：${report.recogFail}`);
   console.log(`重复跳过（已在台账）：${report.dupSkip}`);
   console.log(`可新增指纹：${added.length}`);
 
