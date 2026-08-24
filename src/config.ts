@@ -79,6 +79,7 @@ export interface AppConfig extends Credentials {
   /** 识别/文案/上传等网络请求的超时(ms)，避免挂起阻塞用户串行队列。0/非法则用默认 120000。 */
   requestTimeoutMs: number;
   writeOff: WriteOffConfig;
+  invoiceUsageLedgerPath: string;
 }
 
 export function loadCredentials(): Credentials {
@@ -132,5 +133,6 @@ export function loadConfig(): AppConfig {
     ocr,
     requestTimeoutMs: Math.max(1000, Number(opt('REQUEST_TIMEOUT_MS', '120000')) || 120000),
     writeOff,
+    invoiceUsageLedgerPath: opt('INVOICE_USAGE_LEDGER_PATH', 'data/invoice-usage-ledger.json'),
   };
 }

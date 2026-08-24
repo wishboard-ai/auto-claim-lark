@@ -13,6 +13,8 @@ dist/
 tmp/
 data/loan-writeoff-ledger.json
 data/loan-writeoff-ledger.json.*.tmp
+data/invoice-usage-ledger.json
+data/invoice-usage-ledger.json.*.tmp
 .DS_Store
 
 # Python 字节码缓存（本地 PaddleOCR 服务）

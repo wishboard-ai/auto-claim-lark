@@ -10,7 +10,7 @@
     "start:local": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsc -p tsconfig.json && node --test tests/writeoff.test.cjs",
+    "test": "tsc -p tsconfig.json && node --test tests/writeoff.test.cjs tests/invoice-dedup.test.cjs",
     "inspect:approval": "tsx scripts/inspect-approval.ts"
   },
   "keywords": [

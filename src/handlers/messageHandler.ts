@@ -13,6 +13,7 @@ import { generateContent } from '../llm';
 import { uploadApprovalFile } from '../approval/uploadImage';
 import { LoanWriteOffLedger } from '../writeoff/ledger';
 import { listOutstandingLoans, LoanReference } from '../writeoff/loans';
+import { InvoiceDuplicateError, InvoiceUsageLedger, invoiceFingerprint } from '../invoice/dedup';
 
 const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '好'];
 const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
@@ -21,7 +22,12 @@ const HELP_TEXT =
   '你好，我是费用助手 🧾\n请先选择办理类型：回复「借款核销」或「费用报销」。';
 const MODE_WORDS: Record<string, ClaimMode> = { '借款核销': 'loan_writeoff', '核销': 'loan_writeoff', '费用报销': 'expense', '报销': 'expense' };
 
-export function makeMessageHandler(client: lark.Client, cfg: AppConfig, ledger?: LoanWriteOffLedger) {
+export function makeMessageHandler(
+  client: lark.Client,
+  cfg: AppConfig,
+  ledger?: LoanWriteOffLedger,
+  invoiceUsageLedger?: InvoiceUsageLedger
+) {
   // 幂等去重
   const processed = new Map<string, number>();
   const DEDUP_TTL_MS = 60 * 60 * 1000;
@@ -103,14 +109,14 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig, ledger?:
     draft: Draft,
     loan: LoanReference | undefined,
     mode: ClaimMode
-  ): Promise<void> {
+  ): Promise<boolean> {
     const invoices = items.map((i) => i.invoice);
     const claimAmount = invoices.reduce((sum, invoice) => sum + (Number(invoice.amount) || 0), 0);
     if (mode === 'loan_writeoff' && cfg.writeOff.enabled && ledger) {
-      if (!loan) { await sendText(chatId, '尚未选择要核销的付款申请。'); return; }
+      if (!loan) { await sendText(chatId, '尚未选择要核销的付款申请。'); return false; }
       const remaining = ledger.remaining(loan.instanceCode, Number(loan.amount) || 0);
-      if (submittingLoanCodes.has(loan.instanceCode)) { await sendText(chatId, `付款申请 ${loan.serialNumber} 正在提交另一笔核销，请稍后再试。`); return; }
-      if (claimAmount > remaining + 0.005) { await sendText(chatId, `本次核销金额 ¥${claimAmount.toFixed(2)} 超过该借款剩余可核销金额 ¥${remaining.toFixed(2)}。`); return; }
+      if (submittingLoanCodes.has(loan.instanceCode)) { await sendText(chatId, `付款申请 ${loan.serialNumber} 正在提交另一笔核销，请稍后再试。`); return false; }
+      if (claimAmount > remaining + 0.005) { await sendText(chatId, `本次核销金额 ¥${claimAmount.toFixed(2)} 超过该借款剩余可核销金额 ¥${remaining.toFixed(2)}。`); return false; }
       submittingLoanCodes.add(loan.instanceCode);
     }
 
@@ -139,7 +145,28 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig, ledger?:
           chatId,
           '字段映射尚未配置。请运行 npm run inspect:approval 获取控件ID并填入 config/field-mapping.json。'
         );
-        return;
+        return false;
+      }
+
+      let invoiceReservationId: string | undefined;
+      if (invoiceUsageLedger) {
+        try {
+          invoiceReservationId = invoiceUsageLedger.reserve(invoices, mode, openId);
+        } catch (e) {
+          if (e instanceof InvoiceDuplicateError) {
+            const existing = e.duplicate.existing;
+            const state = existing?.status === 'reserved'
+              ? '正在另一笔审批中使用'
+              : existing
+                ? `已用于${existing.mode === 'loan_writeoff' ? '借款核销' : '费用报销'}`
+                : '在本次单据中重复出现';
+            await sendText(chatId, `检测到重复发票，已停止提交：${e.duplicate.description}\n该发票${state}。`);
+          } else {
+            logger.error('发票检重台账预占失败', e);
+            await sendText(chatId, `发票检重失败，已停止提交：${(e as Error).message}`);
+          }
+          return false;
+        }
       }
 
       let created: Awaited<ReturnType<typeof createApprovalInstance>>;
@@ -147,9 +174,33 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig, ledger?:
         const approvalCode = mode === 'loan_writeoff' ? cfg.approvalCode : cfg.expenseApprovalCode;
         created = await createApprovalInstance(client, cfg, openId, form, title, approvalCode);
       } catch (e) {
+        const message = (e as Error).message || '';
+        const definitelyNotCreated = message.startsWith('飞书返回错误 code=') || message.includes('未返回 instance_code');
+        if (invoiceReservationId && definitelyNotCreated) {
+          try {
+            invoiceUsageLedger?.release(invoiceReservationId);
+          } catch (releaseError) {
+            logger.error('创建审批失败后释放发票预占失败', releaseError);
+          }
+        }
         logger.error('创建审批失败', e);
-        await sendText(chatId, `创建审批失败：${(e as Error).message}`);
-        return;
+        await sendText(
+          chatId,
+          definitelyNotCreated
+            ? `创建审批失败：${message}`
+            : `创建审批结果不确定：${message}\n为防止重复报销，相关发票已保持占用，请联系管理员先核对飞书审批记录。`
+        );
+        return false;
+      }
+
+      if (invoiceReservationId) {
+        try {
+          invoiceUsageLedger?.markSubmitted(invoiceReservationId, created.instanceCode);
+        } catch (e) {
+          // 审批已经创建，不能释放预占；保留 reserved 也能继续阻止重复使用。
+          logger.error(`审批已创建但发票检重台账确认失败（instance=${created.instanceCode}）`, e);
+          await sendText(chatId, `审批已创建，但发票检重台账确认失败：${(e as Error).message}\n请联系管理员检查台账。`);
+        }
       }
 
       if (mode === 'loan_writeoff' && cfg.writeOff.enabled && ledger) {
@@ -163,7 +214,13 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig, ledger?:
           );
         }
       }
-      await sendCard(chatId, successCard(invoices, created.instanceLink, title, categoryLabel, mode));
+      try {
+        await sendCard(chatId, successCard(invoices, created.instanceLink, title, categoryLabel, mode));
+      } catch (e) {
+        logger.warn('审批已创建，但发送成功卡片失败：', (e as Error).message);
+        await sendText(chatId, `审批已创建（实例 ${created.instanceCode}），但结果卡片发送失败，请前往飞书审批中查看。`).catch(() => undefined);
+      }
+      return true;
     } finally {
       if (mode === 'loan_writeoff' && loan) submittingLoanCodes.delete(loan.instanceCode);
     }
@@ -290,6 +347,23 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig, ledger?:
       await sendText(chatId, '无法获取你的用户身份（open_id），无法发起审批。');
       return;
     }
+    const pending = getPending(openId);
+    const fingerprint = invoiceFingerprint(invoice);
+    const duplicateInConversation = pending?.items.find(
+      (existing) => invoiceFingerprint(existing.invoice) === fingerprint
+    );
+    if (duplicateInConversation) {
+      await sendText(chatId, `检测到重复发票：${invoice.typeLabel}${invoice.invoiceNo ? `（号码 ${invoice.invoiceNo}）` : ''} 已在当前对话中，请勿重复发送。`);
+      return;
+    }
+    const previousUsage = invoiceUsageLedger?.find(invoice);
+    if (previousUsage) {
+      const usage = previousUsage.status === 'reserved'
+        ? '正在另一笔审批中使用'
+        : `已用于${previousUsage.mode === 'loan_writeoff' ? '借款核销' : '费用报销'}`;
+      await sendText(chatId, `检测到重复发票：${previousUsage.description} ${usage}，不能再次使用。`);
+      return;
+    }
     const item: CartItem = { invoice };
     if (media?.imageBuffer) {
       item.imageBuffer = media.imageBuffer;
@@ -299,7 +373,7 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig, ledger?:
       item.fileBuffer = media.fileBuffer;
       item.fileName = media.fileName;
     }
-    const mode = getPending(openId)?.mode || 'expense';
+    const mode = pending?.mode || 'expense';
     if (cfg.submitMode === 'direct' && mode === 'expense') {
       const draft = await buildDraft([item], '', mode);
       await submitDraft(chatId, openId, [item], draft, undefined, mode);
@@ -347,8 +421,8 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig, ledger?:
       if (CONFIRM_WORDS.includes(lower)) {
         const items = pending.items;
         const draft = pending.draft;
-        clearPending(openId);
-        await submitDraft(chatId, openId, items, draft, pending.loan, pending.mode);
+        const submitted = await submitDraft(chatId, openId, items, draft, pending.loan, pending.mode);
+        if (submitted) clearPending(openId);
         return;
       }
       // 回复某个合法类别名 → 仅改类别并重新预览（无需再调用 LLM）

@@ -5,6 +5,7 @@ import { makeMessageHandler } from './handlers/messageHandler';
 import { logger } from './logger';
 import { LoanWriteOffLedger } from './writeoff/ledger';
 import { ensureApprovalStatusSubscription, makeApprovalStatusHandler } from './writeoff/approvalHandler';
+import { InvoiceUsageLedger } from './invoice/dedup';
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -13,7 +14,8 @@ async function main(): Promise<void> {
   const client = createClient(cfg);
   const wsClient = createWSClient(cfg);
   const ledger = cfg.writeOff.enabled ? new LoanWriteOffLedger(cfg.writeOff.ledgerPath) : undefined;
-  const { onMessage, onChatEntered } = makeMessageHandler(client, cfg, ledger);
+  const invoiceUsageLedger = new InvoiceUsageLedger(cfg.invoiceUsageLedgerPath);
+  const { onMessage, onChatEntered } = makeMessageHandler(client, cfg, ledger, invoiceUsageLedger);
   const onApprovalStatus = makeApprovalStatusHandler(client, cfg, ledger);
 
   await ensureApprovalStatusSubscription(client, cfg);
