@@ -68,7 +68,7 @@ function isPlaceholderToken(s: string): boolean {
  * 纳税人识别号当作发票号码）。校验不通过返回 undefined（视为无号码 → 指纹回退到字段哈希，
  * 避免不同发票因错误号码撞成同一"毒指纹"）。
  * - 增值税发票：发票号码为纯数字，8 位(传统专普票) 或 20 位(全电/电子发票)。
- * - 出租车票：纯数字，8~11 位（地区有差异）。
+ * - 出租车票：发票号码为 8 位纯数字（与 12 位发票代码组合共 20 位才唯一）；亦接受已组合的 20 位。
  * - 火车票：字母+数字（如 E123456789）或电子发票号，长度 8~25。
  */
 function cleanInvoiceNo(type: InvoiceType, raw?: unknown): string | undefined {
@@ -76,18 +76,38 @@ function cleanInvoiceNo(type: InvoiceType, raw?: unknown): string | undefined {
   if (!s || isPlaceholderToken(s)) return undefined;
   const compact = s.replace(/[\s\-]/g, '');
   if (type === 'vat') return /^\d{8}$/.test(compact) || /^\d{20}$/.test(compact) ? compact : undefined;
-  if (type === 'taxi') return /^\d{8,11}$/.test(compact) ? compact : undefined;
+  if (type === 'taxi') return /^\d{8}$/.test(compact) || /^\d{20}$/.test(compact) ? compact : undefined;
   if (type === 'train') return /^[0-9A-Za-z]{8,25}$/.test(compact) ? compact.toUpperCase() : undefined;
   return compact.length >= 6 ? compact : undefined;
 }
 
-/** 清洗发票代码：增值税发票代码为纯数字 10 或 12 位；其余按 6~15 位数字放宽。占位/不符返回 undefined。 */
+/** 清洗发票代码：增值税/出租车发票代码为纯数字（增值税 10/12 位、出租车 12 位）；其余 6~15 位放宽。 */
 function cleanInvoiceCode(type: InvoiceType, raw?: unknown): string | undefined {
   const s = strOrUndef(raw);
   if (!s || isPlaceholderToken(s)) return undefined;
   const compact = s.replace(/[\s\-]/g, '');
   if (type === 'vat') return /^\d{10}$/.test(compact) || /^\d{12}$/.test(compact) ? compact : undefined;
+  if (type === 'taxi') return /^\d{12}$/.test(compact) ? compact : undefined;
   return /^\d{6,15}$/.test(compact) ? compact : undefined;
+}
+
+/**
+ * 归一化发票号码与代码。出租车票唯一标识 = 12 位发票代码 + 8 位发票号码（共 20 位）：
+ * - 有 12 位代码 + 8 位号码 → 组合成 20 位作为号码（指纹更唯一）；
+ * - 已是 20 位号码 → 原样保留；
+ * - 只有 8 位号码而无有效代码 → 不足以唯一 → 弃用号码，走 fallback 指纹。
+ */
+function resolveNoAndCode(
+  type: InvoiceType,
+  rawNo?: unknown,
+  rawCode?: unknown
+): { invoiceNo?: string; invoiceCode?: string } {
+  let invoiceNo = cleanInvoiceNo(type, rawNo);
+  const invoiceCode = cleanInvoiceCode(type, rawCode);
+  if (type === 'taxi' && invoiceNo && /^\d{8}$/.test(invoiceNo)) {
+    invoiceNo = invoiceCode && /^\d{12}$/.test(invoiceCode) ? invoiceCode + invoiceNo : undefined;
+  }
+  return { invoiceNo, invoiceCode };
 }
 
 // ---- 图片 MIME 识别 ----
@@ -138,6 +158,7 @@ function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
     return { type: 'unknown', typeLabel: '未知票据', raw: normalizeRaw(parsed) };
   }
 
+  const { invoiceNo, invoiceCode } = resolveNoAndCode(type, parsed.invoiceNo, parsed.invoiceCode);
   const invoice: RecognizedInvoice = {
     type,
     typeLabel: strOrUndef(parsed.typeLabel) || TYPE_LABELS[type],
@@ -146,8 +167,8 @@ function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
     sellerName:
       strOrUndef(parsed.sellerName) || (type === 'train' ? '中国铁路' : type === 'taxi' ? '出租车' : undefined),
     buyerName: strOrUndef(parsed.buyerName),
-    invoiceNo: cleanInvoiceNo(type, parsed.invoiceNo),
-    invoiceCode: cleanInvoiceCode(type, parsed.invoiceCode),
+    invoiceNo,
+    invoiceCode,
     checkCode: strOrUndef(parsed.checkCode),
     taxAmount: normAmount(parsed.taxAmount),
     summary: strOrUndef(parsed.summary),
@@ -185,9 +206,9 @@ const FIELD_SPEC =
   '- date: 开票/乘车日期，格式 YYYY-MM-DD；\n' +
   '- sellerName: 销售方/商家/承运方名称；\n' +
   '- buyerName: 购买方名称（无则留空）；\n' +
-  '- invoiceNo: 发票号码/票号。增值税发票的发票号码是【8 位或 20 位纯数字】；' +
-  '切勿把纳税人识别号/统一社会信用代码(18位含字母)/发票代码/日期/金额当作发票号码，找不到就留空；\n' +
-  '- invoiceCode: 发票代码（传统增值税发票为 10 或 12 位纯数字，全电发票通常没有；无则留空）；\n' +
+  '- invoiceNo: 发票号码/票号。增值税发票为【8 位或 20 位纯数字】；出租车票为【8 位纯数字】（其 12 位发票代码填到 invoiceCode）；' +
+  '切勿把纳税人识别号/统一社会信用代码(18位含字母)/日期/金额当作发票号码，找不到就留空；\n' +
+  '- invoiceCode: 发票代码（传统增值税发票 10 或 12 位、出租车票 12 位，纯数字；全电发票通常没有；无则留空）；\n' +
   '- checkCode: 校验码（票面有则填写，无则留空）；\n' +
   '- taxAmount: 税额（元，仅增值税发票，只要数字，无则留空）；\n' +
   '- summary: 摘要（如 出发站→到达站、车次、里程、时间等，无则留空）。\n' +
