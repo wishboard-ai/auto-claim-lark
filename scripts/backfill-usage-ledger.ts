@@ -72,9 +72,18 @@ function extractFileUrls(form: string): string[] {
 }
 
 async function download(url: string, cfg: AppConfig): Promise<Buffer> {
-  const r = await fetchWithTimeout(url, {}, cfg.requestTimeoutMs);
-  if (!r.ok) throw new Error(`下载 HTTP ${r.status}`);
-  return Buffer.from(await r.arrayBuffer());
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const r = await fetchWithTimeout(url, {}, cfg.requestTimeoutMs);
+      if (!r.ok) throw new Error(`下载 HTTP ${r.status}`);
+      return Buffer.from(await r.arrayBuffer());
+    } catch (e) {
+      lastErr = e;
+      if (attempt < 3) await new Promise((res) => setTimeout(res, 1500 * attempt));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 async function recognizeBuffer(cfg: AppConfig, buf: Buffer): Promise<RecognizedInvoice> {
