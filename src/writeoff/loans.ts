@@ -6,7 +6,7 @@ const REASON_ID = 'widget17742552760470001';
 const DETAIL_ID = 'widget17742539539820001';
 const AMOUNT_ID = 'widget17742540352210001';
 const TYPE_ID = 'widget17742532667420001';
-export interface LoanReference { instanceCode: string; serialNumber: string; title: string; approvedAt: string; approvedDate: string; amount?: string; reason?: string; paymentType?: string; link?: string; writtenOffAmount?: string; pendingAmount?: string; remainingAmount?: string }
+export interface LoanReference { instanceCode: string; serialNumber: string; title: string; approvedAt: string; approvedDate: string; applicantOpenId?: string; amount?: string; reason?: string; paymentType?: string; link?: string; writtenOffAmount?: string; pendingAmount?: string; remainingAmount?: string }
 type FormNode = { id?: string; name?: string; value?: unknown; [key: string]: unknown };
 function nodes(value: unknown): FormNode[] {
   if (Array.isArray(value)) return value.flatMap(nodes);
@@ -32,14 +32,33 @@ function shanghaiDate(iso: string): string {
   return `${part('year')}-${part('month')}-${part('day')}`;
 }
 /** 实际借款时间严格取付款申请审批实例的 end_time。 */
-export function parseLoanDetail(data: { instance_code: string; serial_number: string; approval_name: string; end_time: string; form: string }, link?: string): LoanReference {
+export function parseLoanDetail(data: { instance_code: string; serial_number: string; approval_name: string; end_time: string; form: string; open_id?: string }, link?: string): LoanReference {
   const all = nodes(JSON.parse(data.form || '[]'));
   const find = (id: string) => all.find((n) => n.id === id);
   const total = nodes(find(DETAIL_ID)?.value).filter((n) => n.id === AMOUNT_ID).reduce((s, n) => s + numeric(n.value), 0);
   const approvedAt = isoTime(data.end_time);
-  return { instanceCode: data.instance_code, serialNumber: data.serial_number, title: data.approval_name, approvedAt, approvedDate: shanghaiDate(approvedAt), amount: total > 0 ? total.toFixed(2) : undefined, reason: display(find(REASON_ID)?.value), paymentType: display(find(TYPE_ID)?.value), link };
+  return { instanceCode: data.instance_code, serialNumber: data.serial_number, title: data.approval_name, approvedAt, approvedDate: shanghaiDate(approvedAt), applicantOpenId: data.open_id, amount: total > 0 ? total.toFixed(2) : undefined, reason: display(find(REASON_ID)?.value), paymentType: display(find(TYPE_ID)?.value), link };
 }
-export async function listOutstandingLoans(client: lark.Client, cfg: AppConfig, openId: string, ledger: LoanWriteOffLedger): Promise<LoanReference[]> {
+
+/** 付款申请审批定义的管理员可以代其他申请人办理核销。 */
+export async function isLoanApprovalAdmin(client: lark.Client, cfg: AppConfig, openId: string): Promise<boolean> {
+  const response = await client.approval.v4.approval.get({
+    path: { approval_code: cfg.writeOff.loanApprovalCode },
+    params: { with_admin_id: true, user_id_type: 'open_id' },
+  });
+  if (typeof response.code === 'number' && response.code !== 0) {
+    throw new Error(`查询付款申请管理员失败 code=${response.code} msg=${response.msg}`);
+  }
+  return response.data?.approval_admin_ids?.includes(openId) ?? false;
+}
+
+export async function listOutstandingLoans(
+  client: lark.Client,
+  cfg: AppConfig,
+  openId: string,
+  ledger: LoanWriteOffLedger,
+  allApplicants = false
+): Promise<LoanReference[]> {
   const now = Date.now();
   const oldest = now - cfg.writeOff.lookbackDays * 86_400_000;
   // 飞书要求起止时间同时传递，且单次查询跨度不得超过 30 天。
@@ -51,7 +70,7 @@ export async function listOutstandingLoans(client: lark.Client, cfg: AppConfig, 
     do {
       const response = await client.approval.v4.instance.query({
         data: {
-          user_id: openId,
+          ...(allApplicants ? {} : { user_id: openId }),
           approval_code: cfg.writeOff.loanApprovalCode,
           instance_status: 'APPROVED',
           instance_start_time_from: String(windowStart),

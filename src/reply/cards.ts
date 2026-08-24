@@ -41,8 +41,11 @@ export function writeOffCard(
   });
 }
 
-export function loanSelectionCard(loans: Array<{ serialNumber: string; approvedDate: string; amount?: string; reason?: string }>): string {
-  const lines = loans.map((loan: any, i) => `${i + 1}. **${loan.serialNumber}**　借款 ¥${loan.amount ?? '-'}　剩余 ¥${loan.remainingAmount ?? loan.amount ?? '-'}　${loan.approvedDate}\n   ${loan.reason ?? ''}`).join('\n');
+export function loanSelectionCard(loans: Array<{ serialNumber: string; approvedDate: string; applicantOpenId?: string; amount?: string; remainingAmount?: string; reason?: string }>, showApplicant = false): string {
+  const lines = loans.map((loan, i) => {
+    const applicant = showApplicant && loan.applicantOpenId ? `　申请人 <at id=${loan.applicantOpenId}></at>` : '';
+    return `${i + 1}. **${loan.serialNumber}**　借款 ¥${loan.amount ?? '-'}　剩余 ¥${loan.remainingAmount ?? loan.amount ?? '-'}　${loan.approvedDate}${applicant}\n   ${loan.reason ?? ''}`;
+  }).join('\n');
   return JSON.stringify({ config: { wide_screen_mode: true }, header: { template: 'blue', title: { tag: 'plain_text', content: '请选择要核销的借款' } }, elements: [{ tag: 'div', text: { tag: 'lark_md', content: lines } }, { tag: 'hr' }, { tag: 'div', text: { tag: 'lark_md', content: '回复序号（例如 **1**）选择付款申请。日期为该付款申请审批真正通过的日期。' } }] });
 }
 

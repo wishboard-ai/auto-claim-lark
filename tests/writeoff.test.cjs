@@ -4,7 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { afterEach, test } = require('node:test');
 const { LoanWriteOffLedger } = require('../dist/src/writeoff/ledger.js');
-const { parseLoanDetail, listOutstandingLoans } = require('../dist/src/writeoff/loans.js');
+const { parseLoanDetail, isLoanApprovalAdmin, listOutstandingLoans } = require('../dist/src/writeoff/loans.js');
 const { makeApprovalStatusHandler } = require('../dist/src/writeoff/approvalHandler.js');
 const { buildApprovalForm, getCategoryOptionNames } = require('../dist/src/approval/fieldMapping.js');
 const { createApprovalInstance } = require('../dist/src/approval/submit.js');
@@ -85,6 +85,36 @@ test('机器人按当前用户查询借款，并只返回仍有可核销余额�
   }));
   assert.equal(loans.length, 1);
   assert.equal(loans[0].remainingAmount, '60.00');
+});
+
+test('付款申请管理员核销时可查询所有申请人的未核销付款申请', async () => {
+  const store = ledger();
+  const queryPayloads = [];
+  const client = {
+    approval: { v4: {
+      approval: {
+        get: async () => ({ code: 0, data: { approval_admin_ids: ['admin-open-id'] } }),
+      },
+      instance: {
+        query: async (payload) => {
+          queryPayloads.push(payload);
+          return { code: 0, data: { instance_list: [{ instance: { code: 'loan-other-user' } }], has_more: false } };
+        },
+        get: async () => ({ code: 0, data: { instance_code: 'loan-other-user', serial_number: '20260824002', approval_name: '付款申请', open_id: 'applicant-open-id', status: 'APPROVED', end_time: '1787542200000', form: paymentForm('200.00') } }),
+      },
+    } },
+  };
+  const cfg = { writeOff: { loanApprovalCode: 'payment-code', lookbackDays: 30 } };
+
+  assert.equal(await isLoanApprovalAdmin(client, cfg, 'admin-open-id'), true);
+  assert.equal(await isLoanApprovalAdmin(client, cfg, 'ordinary-open-id'), false);
+  const loans = await listOutstandingLoans(client, cfg, 'admin-open-id', store, true);
+
+  assert.ok(queryPayloads.length > 0);
+  assert.ok(queryPayloads.every((payload) => !('user_id' in payload.data)));
+  assert.equal(loans.length, 1);
+  assert.equal(loans[0].applicantOpenId, 'applicant-open-id');
+  assert.equal(loans[0].remainingAmount, '200.00');
 });
 
 test('确认后以当前用户身份发起正确的借款核销审批定义', async () => {

@@ -12,7 +12,7 @@ import { addedCard, successCard, previewCard, loanSelectionCard, modeSelectionCa
 import { generateContent } from '../llm';
 import { uploadApprovalFile } from '../approval/uploadImage';
 import { LoanWriteOffLedger } from '../writeoff/ledger';
-import { listOutstandingLoans, LoanReference } from '../writeoff/loans';
+import { isLoanApprovalAdmin, listOutstandingLoans, LoanReference } from '../writeoff/loans';
 import { InvoiceDuplicateError, InvoiceUsageLedger, invoiceFingerprint } from '../invoice/dedup';
 
 const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '好'];
@@ -462,14 +462,21 @@ export function makeMessageHandler(
     }
 
     if (pending.mode === 'loan_writeoff' && cfg.writeOff.enabled && ledger) {
-      const loans = await listOutstandingLoans(client, cfg, openId, ledger);
+      let isAdmin = false;
+      try {
+        isAdmin = await isLoanApprovalAdmin(client, cfg, openId);
+      } catch (error) {
+        // 管理员信息读取失败时降级为本人查询，避免影响原有普通用户核销流程。
+        logger.warn('无法判断付款申请管理员身份，按普通用户查询：', (error as Error).message);
+      }
+      const loans = await listOutstandingLoans(client, cfg, openId, ledger, isAdmin);
       if (!loans.length) {
-        await sendText(chatId, `未找到近 ${cfg.writeOff.lookbackDays} 天内已通过且尚未核销的付款申请。`);
+        await sendText(chatId, `未找到近 ${cfg.writeOff.lookbackDays} 天内已通过且尚未核销的${isAdmin ? '' : '本人'}付款申请。`);
         return;
       }
       if (loans.length > 1) {
         setLoanSelection(openId, loans, raw);
-        await sendCard(chatId, loanSelectionCard(loans));
+        await sendCard(chatId, loanSelectionCard(loans, isAdmin));
         return;
       }
       selectLoan(openId, loans[0]);
