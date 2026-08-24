@@ -120,6 +120,7 @@ async function main(): Promise<void> {
   const cfg = loadConfig();
   const client = createClient(cfg);
   const write = hasFlag('--write');
+  const listOnly = hasFlag('--list-only');
   const which = (argVal('--approval') || 'both').toLowerCase();
   const statuses = new Set(
     (argVal('--status') || 'PENDING,APPROVED')
@@ -151,6 +152,8 @@ async function main(): Promise<void> {
     noFile: [] as string[],
     recogFail: 0,
     dupSkip: 0,
+    inScope: 0,
+    totalUrls: 0,
   };
 
   console.log(
@@ -177,6 +180,9 @@ async function main(): Promise<void> {
         report.noFile.push(code);
         continue;
       }
+      report.inScope++;
+      report.totalUrls += urls.length;
+      if (listOnly) continue; // 只统计规模，不下载/不OCR
       const openId = d.open_id || d.user_id || '';
       const createdAt = isoTime(d.start_time);
       const submittedAt = isoTime(d.end_time || d.start_time);
@@ -218,6 +224,15 @@ async function main(): Promise<void> {
   console.log(`扫描实例：${report.instances}`);
   console.log(`按状态跳过：${JSON.stringify(report.statusSkipped)}（不在 ${[...statuses].join(',')} 内，如 CANCELED/REJECTED）`);
   console.log(`无图片/附件（无法回溯）：${report.noFile.length}`);
+  console.log(`在范围内(有图/附件)实例：${report.inScope}，其中文件/发票数约：${report.totalUrls}`);
+
+  if (listOnly) {
+    const mins = Math.ceil((report.totalUrls * 38) / 60);
+    console.log(`\n[list-only] 仅统计规模，未下载/未识别。`);
+    console.log(`预计需 OCR 约 ${report.totalUrls} 个文件；按 ~38s/个 粗估约 ${mins} 分钟（文本型PDF更快）。`);
+    return;
+  }
+
   console.log(`识别失败/未知票种：${report.recogFail}`);
   console.log(`重复跳过（已在台账）：${report.dupSkip}`);
   console.log(`可新增指纹：${added.length}`);
