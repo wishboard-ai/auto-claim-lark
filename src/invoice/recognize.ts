@@ -51,6 +51,45 @@ function strOrUndef(v?: unknown): string | undefined {
   return s && s.toLowerCase() !== 'null' && s !== '无' ? s : undefined;
 }
 
+// ---- 发票号码/代码清洗（按票种的标准位数校验，剔除占位词与明显错误） ----
+
+// 占位/无意义取值（模型有时会把"未知/无/N/A"等填进号码字段）
+const PLACEHOLDER_TOKENS = new Set([
+  '未知', '无', '无号码', '未提供', '不详', '待定', '暂无', 'none', 'null', 'nil', 'na', 'n/a',
+  '-', '—', '/', '?', '？', '*', '空',
+]);
+function isPlaceholderToken(s: string): boolean {
+  const t = s.replace(/\s/g, '').toLowerCase();
+  return t === '' || PLACEHOLDER_TOKENS.has(t);
+}
+
+/**
+ * 清洗发票号码：按票种「统一的位数格式」校验，剔除占位词/明显错误（如误把统一社会信用代码、
+ * 纳税人识别号当作发票号码）。校验不通过返回 undefined（视为无号码 → 指纹回退到字段哈希，
+ * 避免不同发票因错误号码撞成同一"毒指纹"）。
+ * - 增值税发票：发票号码为纯数字，8 位(传统专普票) 或 20 位(全电/电子发票)。
+ * - 出租车票：纯数字，8~11 位（地区有差异）。
+ * - 火车票：字母+数字（如 E123456789）或电子发票号，长度 8~25。
+ */
+function cleanInvoiceNo(type: InvoiceType, raw?: unknown): string | undefined {
+  const s = strOrUndef(raw);
+  if (!s || isPlaceholderToken(s)) return undefined;
+  const compact = s.replace(/[\s\-]/g, '');
+  if (type === 'vat') return /^\d{8}$/.test(compact) || /^\d{20}$/.test(compact) ? compact : undefined;
+  if (type === 'taxi') return /^\d{8,11}$/.test(compact) ? compact : undefined;
+  if (type === 'train') return /^[0-9A-Za-z]{8,25}$/.test(compact) ? compact.toUpperCase() : undefined;
+  return compact.length >= 6 ? compact : undefined;
+}
+
+/** 清洗发票代码：增值税发票代码为纯数字 10 或 12 位；其余按 6~15 位数字放宽。占位/不符返回 undefined。 */
+function cleanInvoiceCode(type: InvoiceType, raw?: unknown): string | undefined {
+  const s = strOrUndef(raw);
+  if (!s || isPlaceholderToken(s)) return undefined;
+  const compact = s.replace(/[\s\-]/g, '');
+  if (type === 'vat') return /^\d{10}$/.test(compact) || /^\d{12}$/.test(compact) ? compact : undefined;
+  return /^\d{6,15}$/.test(compact) ? compact : undefined;
+}
+
 // ---- 图片 MIME 识别 ----
 
 function mimeForImage(buf: Buffer): string {
@@ -107,8 +146,8 @@ function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
     sellerName:
       strOrUndef(parsed.sellerName) || (type === 'train' ? '中国铁路' : type === 'taxi' ? '出租车' : undefined),
     buyerName: strOrUndef(parsed.buyerName),
-    invoiceNo: strOrUndef(parsed.invoiceNo),
-    invoiceCode: strOrUndef(parsed.invoiceCode),
+    invoiceNo: cleanInvoiceNo(type, parsed.invoiceNo),
+    invoiceCode: cleanInvoiceCode(type, parsed.invoiceCode),
     checkCode: strOrUndef(parsed.checkCode),
     taxAmount: normAmount(parsed.taxAmount),
     summary: strOrUndef(parsed.summary),
@@ -146,8 +185,9 @@ const FIELD_SPEC =
   '- date: 开票/乘车日期，格式 YYYY-MM-DD；\n' +
   '- sellerName: 销售方/商家/承运方名称；\n' +
   '- buyerName: 购买方名称（无则留空）；\n' +
-  '- invoiceNo: 发票号码/票号；\n' +
-  '- invoiceCode: 发票代码（票面有则填写，无则留空）；\n' +
+  '- invoiceNo: 发票号码/票号。增值税发票的发票号码是【8 位或 20 位纯数字】；' +
+  '切勿把纳税人识别号/统一社会信用代码(18位含字母)/发票代码/日期/金额当作发票号码，找不到就留空；\n' +
+  '- invoiceCode: 发票代码（传统增值税发票为 10 或 12 位纯数字，全电发票通常没有；无则留空）；\n' +
   '- checkCode: 校验码（票面有则填写，无则留空）；\n' +
   '- taxAmount: 税额（元，仅增值税发票，只要数字，无则留空）；\n' +
   '- summary: 摘要（如 出发站→到达站、车次、里程、时间等，无则留空）。\n' +
