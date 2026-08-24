@@ -11,6 +11,8 @@ dist/
 # 日志与临时文件
 *.log
 tmp/
+data/loan-writeoff-ledger.json
+data/loan-writeoff-ledger.json.*.tmp
 .DS_Store
 
 # Python 字节码缓存（本地 PaddleOCR 服务）

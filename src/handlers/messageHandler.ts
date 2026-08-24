@@ -7,18 +7,21 @@ import { pdfFirstPageToImage, extractPdfText, hasUsableText, isPdf } from '../in
 import { recognizeInvoice, recognizeInvoiceFromText, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
 import { buildApprovalForm, FormOverrides, getCategoryOptionNames } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
-import { addItem, getPending, clearPending, setDraft, CartItem, Draft } from './session';
-import { addedCard, successCard, previewCard } from '../reply/cards';
+import { addItem, getPending, clearPending, setDraft, setLoanSelection, selectLoan, startSession, CartItem, Draft, ClaimMode } from './session';
+import { addedCard, successCard, previewCard, loanSelectionCard, modeSelectionCard } from '../reply/cards';
 import { generateContent } from '../llm';
 import { uploadApprovalFile } from '../approval/uploadImage';
+import { LoanWriteOffLedger } from '../writeoff/ledger';
+import { listOutstandingLoans, LoanReference } from '../writeoff/loans';
 
 const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '好'];
 const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
 
 const HELP_TEXT =
-  '你好，我是发票报销助手 🧾\n发送发票图片或 PDF（增值税发票 / 火车票 / 出租车票），可连续发送多张累加到同一张报销单；\n发完后回复本次「报销事由」（例如：1月客户拜访交通费），我会生成预览，回复「确认」后再提交，或回复「取消」放弃。';
+  '你好，我是费用助手 🧾\n请先选择办理类型：回复「借款核销」或「费用报销」。';
+const MODE_WORDS: Record<string, ClaimMode> = { '借款核销': 'loan_writeoff', '核销': 'loan_writeoff', '费用报销': 'expense', '报销': 'expense' };
 
-export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
+export function makeMessageHandler(client: lark.Client, cfg: AppConfig, ledger?: LoanWriteOffLedger) {
   // 幂等去重
   const processed = new Map<string, number>();
   const DEDUP_TTL_MS = 60 * 60 * 1000;
@@ -33,6 +36,8 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   // 进入会话欢迎语节流
   const welcomed = new Map<string, number>();
   const WELCOME_TTL_MS = 30 * 60 * 1000;
+  // 防止两个并发提交在飞书创建接口等待期间绕过台账查重。
+  const submittingLoanCodes = new Set<string>();
 
   // 每个用户一条串行队列：消息按「到达顺序」逐条处理，不同用户之间仍并行。
   // 作用：① 多张发票严格按发送顺序累加；② 避免「报销事由」抢在图片识别完成前被处理
@@ -65,9 +70,15 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   }
 
   /** 计算 LLM 文案与类别，产出待确认草稿（不创建审批）。 */
-  async function buildDraft(items: CartItem[], reason: string): Promise<Draft> {
+  async function buildDraft(items: CartItem[], reason: string, mode: ClaimMode): Promise<Draft> {
     const invoices = items.map((i) => i.invoice);
-    const gen = await generateContent(cfg, invoices, reason, getCategoryOptionNames());
+    const gen = await generateContent(
+      cfg,
+      invoices,
+      reason,
+      getCategoryOptionNames(mode),
+      mode === 'loan_writeoff' ? '借款核销' : '费用报销'
+    );
     if (gen) {
       logger.info(`LLM 生成标题：${gen.title}`);
       if (gen.category) logger.info(`LLM 选择报销类别：${gen.category}`);
@@ -76,10 +87,12 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   }
 
   /** 展示「提交前预览/确认」卡片（不创建审批）。 */
-  async function showPreview(chatId: string, items: CartItem[], draft: Draft): Promise<void> {
+  async function showPreview(chatId: string, items: CartItem[], draft: Draft, mode: ClaimMode, loan?: LoanReference): Promise<void> {
     const invoices = items.map((i) => i.invoice);
-    const { title, categoryLabel } = buildApprovalForm(invoices, draftToOverrides(draft), []);
-    await sendCard(chatId, previewCard(invoices, title, categoryLabel, draft.reason, getCategoryOptionNames()));
+    const built = buildApprovalForm(invoices, draftToOverrides(draft), [], [], loan);
+    const title = mode === 'expense' ? built.title.replace(/^借款核销/, '费用报销') : built.title;
+    const categoryLabel = built.categoryLabel;
+    await sendCard(chatId, previewCard(invoices, title, categoryLabel, draft.reason, getCategoryOptionNames(mode), loan, mode));
   }
 
   /** 用草稿实际创建审批：上传图片 → 构建表单 → 创建 → 回复结果卡片。 */
@@ -87,41 +100,72 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     chatId: string,
     openId: string,
     items: CartItem[],
-    draft: Draft
+    draft: Draft,
+    loan: LoanReference | undefined,
+    mode: ClaimMode
   ): Promise<void> {
     const invoices = items.map((i) => i.invoice);
-    // 上传素材：图片 → 「图片」控件；原始 PDF → 「附件」控件（失败不阻断）
-    const imageCodes: string[] = [];
-    const attachmentCodes: string[] = [];
-    for (const it of items) {
-      if (it.imageBuffer) {
-        const code = await uploadApprovalFile(cfg, it.imageBuffer, `invoice.${it.imageExt || 'jpg'}`, 'image');
-        if (code) imageCodes.push(code);
-      }
-      if (it.fileBuffer) {
-        const code = await uploadApprovalFile(cfg, it.fileBuffer, it.fileName || 'invoice.pdf', 'attachment');
-        if (code) attachmentCodes.push(code);
-      }
+    const claimAmount = invoices.reduce((sum, invoice) => sum + (Number(invoice.amount) || 0), 0);
+    if (mode === 'loan_writeoff' && cfg.writeOff.enabled && ledger) {
+      if (!loan) { await sendText(chatId, '尚未选择要核销的付款申请。'); return; }
+      const remaining = ledger.remaining(loan.instanceCode, Number(loan.amount) || 0);
+      if (submittingLoanCodes.has(loan.instanceCode)) { await sendText(chatId, `付款申请 ${loan.serialNumber} 正在提交另一笔核销，请稍后再试。`); return; }
+      if (claimAmount > remaining + 0.005) { await sendText(chatId, `本次核销金额 ¥${claimAmount.toFixed(2)} 超过该借款剩余可核销金额 ¥${remaining.toFixed(2)}。`); return; }
+      submittingLoanCodes.add(loan.instanceCode);
     }
-    const { form, title, categoryLabel } = buildApprovalForm(
-      invoices,
-      draftToOverrides(draft),
-      imageCodes,
-      attachmentCodes
-    );
-    if (form.length === 0) {
-      await sendText(
-        chatId,
-        '字段映射尚未配置。请运行 npm run inspect:approval 获取控件ID并填入 config/field-mapping.json。'
-      );
-      return;
-    }
+
     try {
-      const { instanceLink } = await createApprovalInstance(client, cfg, openId, form, title);
-      await sendCard(chatId, successCard(invoices, instanceLink, title, categoryLabel));
-    } catch (e) {
-      logger.error('创建审批失败', e);
-      await sendText(chatId, `创建审批失败：${(e as Error).message}`);
+      // 上传素材：图片 → 「图片」控件；原始 PDF → 「附件」控件（失败不阻断）
+      const imageCodes: string[] = [];
+      const attachmentCodes: string[] = [];
+      for (const it of items) {
+        if (it.imageBuffer) {
+          const code = await uploadApprovalFile(cfg, it.imageBuffer, `invoice.${it.imageExt || 'jpg'}`, 'image');
+          if (code) imageCodes.push(code);
+        }
+        if (it.fileBuffer) {
+          const code = await uploadApprovalFile(cfg, it.fileBuffer, it.fileName || 'invoice.pdf', 'attachment');
+          if (code) attachmentCodes.push(code);
+        }
+      }
+      const reason = mode === 'loan_writeoff' && loan ? `[付款申请 ${loan.serialNumber}] ${draft.reason}` : draft.reason;
+      const effectiveDraft = { ...draft, reason };
+      const built = buildApprovalForm(invoices, draftToOverrides(effectiveDraft), imageCodes, attachmentCodes, loan);
+      const form = built.form;
+      const title = mode === 'expense' ? built.title.replace(/^借款核销/, '费用报销') : built.title;
+      const categoryLabel = built.categoryLabel;
+      if (form.length === 0) {
+        await sendText(
+          chatId,
+          '字段映射尚未配置。请运行 npm run inspect:approval 获取控件ID并填入 config/field-mapping.json。'
+        );
+        return;
+      }
+
+      let created: Awaited<ReturnType<typeof createApprovalInstance>>;
+      try {
+        const approvalCode = mode === 'loan_writeoff' ? cfg.approvalCode : cfg.expenseApprovalCode;
+        created = await createApprovalInstance(client, cfg, openId, form, title, approvalCode);
+      } catch (e) {
+        logger.error('创建审批失败', e);
+        await sendText(chatId, `创建审批失败：${(e as Error).message}`);
+        return;
+      }
+
+      if (mode === 'loan_writeoff' && cfg.writeOff.enabled && ledger) {
+        try {
+          ledger.recordSubmitted(loan!.instanceCode, created.instanceCode, openId, chatId, claimAmount, Number(loan!.amount) || 0);
+        } catch (e) {
+          logger.error(`审批已创建但写入核销台账失败（instance=${created.instanceCode}）`, e);
+          await sendText(
+            chatId,
+            `审批已创建，但核销台账登记失败：${(e as Error).message}\n请联系管理员人工登记，避免重复核销。`
+          );
+        }
+      }
+      await sendCard(chatId, successCard(invoices, created.instanceLink, title, categoryLabel, mode));
+    } finally {
+      if (mode === 'loan_writeoff' && loan) submittingLoanCodes.delete(loan.instanceCode);
     }
   }
 
@@ -255,12 +299,13 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       item.fileBuffer = media.fileBuffer;
       item.fileName = media.fileName;
     }
-    if (cfg.submitMode === 'direct') {
-      const draft = await buildDraft([item], '');
-      await submitDraft(chatId, openId, [item], draft);
+    const mode = getPending(openId)?.mode || 'expense';
+    if (cfg.submitMode === 'direct' && mode === 'expense') {
+      const draft = await buildDraft([item], '', mode);
+      await submitDraft(chatId, openId, [item], draft, undefined, mode);
     } else {
       const claim = addItem(openId, item);
-      await sendCard(chatId, addedCard(claim.items.map((i) => i.invoice)));
+      await sendCard(chatId, addedCard(claim.items.map((i) => i.invoice), mode));
     }
   }
 
@@ -277,9 +322,23 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       await sendText(chatId, '已取消本次报销。');
       return;
     }
-    const pending = openId ? getPending(openId) : undefined;
-    if (!openId || !pending || pending.items.length === 0) {
-      await sendText(chatId, HELP_TEXT);
+    let pending = openId ? getPending(openId) : undefined;
+    const chosenMode = MODE_WORDS[raw];
+    if (openId && chosenMode && (!pending || pending.items.length === 0)) {
+      if (chosenMode === 'loan_writeoff' && (!cfg.writeOff.enabled || !ledger)) {
+        await sendText(chatId, '借款核销功能当前未启用，请联系管理员检查 LOAN_WRITE_OFF_ENABLED 和核销台账配置。');
+        return;
+      }
+      pending = startSession(openId, chosenMode);
+      await sendText(chatId, chosenMode === 'loan_writeoff' ? '已选择「借款核销」。请发送本次实际消费的发票，发送完成后回复核销事由。' : '已选择「费用报销」。请发送报销发票，发送完成后回复报销事由。');
+      return;
+    }
+    if (!openId || !pending) {
+      await sendCard(chatId, modeSelectionCard());
+      return;
+    }
+    if (pending.items.length === 0) {
+      await sendText(chatId, `当前已选择「${pending.mode === 'loan_writeoff' ? '借款核销' : '费用报销'}」，请发送发票图片或 PDF。`);
       return;
     }
 
@@ -289,31 +348,66 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
         const items = pending.items;
         const draft = pending.draft;
         clearPending(openId);
-        await submitDraft(chatId, openId, items, draft);
+        await submitDraft(chatId, openId, items, draft, pending.loan, pending.mode);
         return;
       }
       // 回复某个合法类别名 → 仅改类别并重新预览（无需再调用 LLM）
-      if (getCategoryOptionNames().includes(raw)) {
+      if (getCategoryOptionNames(pending.mode).includes(raw)) {
         const draft: Draft = { ...pending.draft, category: raw };
         setDraft(openId, draft);
-        await showPreview(chatId, pending.items, draft);
+        await showPreview(chatId, pending.items, draft, pending.mode, pending.loan);
         return;
       }
-      // 其他文字 → 作为新的报销事由，重新整理并再次预览
-      const draft = await buildDraft(pending.items, raw);
+      // 其他文字 → 作为新的核销事由，重新整理并再次预览
+      const draft = await buildDraft(pending.items, raw, pending.mode);
       setDraft(openId, draft);
-      await showPreview(chatId, pending.items, draft);
+      await showPreview(chatId, pending.items, draft, pending.mode, pending.loan);
       return;
     }
 
     // 阶段一：收集完成，首次回复事由 → 生成预览（不直接提交）
     if (CONFIRM_WORDS.includes(lower) || raw === '') {
-      await sendText(chatId, '请先回复本次报销的事由（例如：1月客户拜访交通费），我会生成预览，确认后再提交。');
+      await sendText(chatId, pending.mode === 'loan_writeoff'
+        ? '请先回复本次核销的事由（例如：客户拜访交通费），我会关联付款申请并生成预览。'
+        : '请先回复本次报销的事由（例如：客户拜访交通费），我会生成费用报销预览。');
       return;
     }
-    const draft = await buildDraft(pending.items, raw);
+    if (pending.loanCandidates?.length) {
+      const index = Number(raw) - 1;
+      const loan = pending.loanCandidates[index];
+      if (!Number.isInteger(index) || !loan) {
+        await sendText(chatId, `请输入 1-${pending.loanCandidates.length} 之间的序号选择付款申请。`);
+        return;
+      }
+      const reason = pending.pendingReason || '借款核销';
+      selectLoan(openId, loan);
+      const draft = await buildDraft(pending.items, reason, pending.mode);
+      setDraft(openId, draft);
+      await showPreview(chatId, pending.items, draft, pending.mode, loan);
+      return;
+    }
+
+    if (pending.mode === 'loan_writeoff' && cfg.writeOff.enabled && ledger) {
+      const loans = await listOutstandingLoans(client, cfg, openId, ledger);
+      if (!loans.length) {
+        await sendText(chatId, `未找到近 ${cfg.writeOff.lookbackDays} 天内已通过且尚未核销的付款申请。`);
+        return;
+      }
+      if (loans.length > 1) {
+        setLoanSelection(openId, loans, raw);
+        await sendCard(chatId, loanSelectionCard(loans));
+        return;
+      }
+      selectLoan(openId, loans[0]);
+      const draft = await buildDraft(pending.items, raw, pending.mode);
+      setDraft(openId, draft);
+      await showPreview(chatId, pending.items, draft, pending.mode, loans[0]);
+      return;
+    }
+
+    const draft = await buildDraft(pending.items, raw, pending.mode);
     setDraft(openId, draft);
-    await showPreview(chatId, pending.items, draft);
+    await showPreview(chatId, pending.items, draft, pending.mode);
   }
 
   async function onChatEntered(event: any): Promise<void> {
@@ -324,7 +418,7 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     if (last && now - last < WELCOME_TTL_MS) return;
     welcomed.set(chatId, now);
     try {
-      await sendText(chatId, HELP_TEXT);
+      await sendCard(chatId, modeSelectionCard());
     } catch (e) {
       logger.warn('发送欢迎语失败：', (e as Error).message);
     }
@@ -348,7 +442,10 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     const key = openId || chatId;
     enqueue(key, async () => {
       try {
-        if (msgType === 'image') {
+        const session = openId ? getPending(openId) : undefined;
+        if ((msgType === 'image' || msgType === 'file') && !session) {
+          await sendCard(chatId, modeSelectionCard());
+        } else if (msgType === 'image') {
           await handleImage(chatId, openId, messageId, message.content);
         } else if (msgType === 'file') {
           await handleFile(chatId, openId, messageId, message.content);

@@ -108,6 +108,8 @@ function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
       strOrUndef(parsed.sellerName) || (type === 'train' ? '中国铁路' : type === 'taxi' ? '出租车' : undefined),
     buyerName: strOrUndef(parsed.buyerName),
     invoiceNo: strOrUndef(parsed.invoiceNo),
+    invoiceCode: strOrUndef(parsed.invoiceCode),
+    checkCode: strOrUndef(parsed.checkCode),
     taxAmount: normAmount(parsed.taxAmount),
     summary: strOrUndef(parsed.summary),
     raw: normalizeRaw(parsed),
@@ -145,11 +147,14 @@ const FIELD_SPEC =
   '- sellerName: 销售方/商家/承运方名称；\n' +
   '- buyerName: 购买方名称（无则留空）；\n' +
   '- invoiceNo: 发票号码/票号；\n' +
+  '- invoiceCode: 发票代码（票面有则填写，无则留空）；\n' +
+  '- checkCode: 校验码（票面有则填写，无则留空）；\n' +
   '- taxAmount: 税额（元，仅增值税发票，只要数字，无则留空）；\n' +
   '- summary: 摘要（如 出发站→到达站、车次、里程、时间等，无则留空）。\n' +
   '严禁编造{SRC}中不存在的信息，找不到的字段填空字符串。\n' +
   '返回示例：{"type":"train","amount":"553.5","date":"2024-01-15","sellerName":"中国铁路",' +
-  '"buyerName":"","invoiceNo":"E123456789","taxAmount":"","summary":"北京南→上海虹桥 G1 二等座"}';
+  '"buyerName":"","invoiceNo":"E123456789","invoiceCode":"","checkCode":"","taxAmount":"",' +
+  '"summary":"北京南→上海虹桥 G1 二等座"}';
 
 const EXTRACT_PROMPT =
   '你是发票识别助手。请识别图片中的票据类型并抽取关键字段，只返回一个严格的 JSON 对象，' +

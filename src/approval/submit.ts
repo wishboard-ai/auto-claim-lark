@@ -8,7 +8,7 @@ export interface CreatedInstance {
 }
 
 /**
- * 创建费用报销审批实例（自动填充表单）。
+ * 创建借款核销审批实例（自动填充表单）。
  *
  * 说明：飞书 approval.v4.instance.create 创建后会直接发起、进入审批流；
  * OpenAPI 不提供「仅创建草稿、由用户在审批中手动提交」的能力。
@@ -19,11 +19,12 @@ export async function createApprovalInstance(
   cfg: AppConfig,
   openId: string,
   form: FormField[],
-  title: string
+  title: string,
+  approvalCode = cfg.approvalCode
 ): Promise<CreatedInstance> {
   const resp = await client.approval.v4.instance.create({
     data: {
-      approval_code: cfg.approvalCode,
+      approval_code: approvalCode,
       open_id: openId,
       form: JSON.stringify(form),
       title,

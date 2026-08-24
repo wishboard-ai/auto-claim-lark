@@ -2,14 +2,18 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { RecognizedInvoice, FormField } from '../types';
 import { logger } from '../logger';
+import { LoanReference } from '../writeoff/loans';
 
 type ValueFormat = 'string' | 'number' | 'date' | 'datetime';
 type FieldRole = 'reason' | 'content' | 'title' | 'category';
+type MappingMode = 'loan_writeoff' | 'expense';
 
 interface FieldSpec {
   widgetId: string;
   widgetType: string;
   source?: string;
+  /** 借款核销模式下替代 source（例如明细日期改取付款申请 end_time）。 */
+  loanSource?: string;
   constValue?: string;
   valueByType?: Record<string, string>;
   valueFormat?: ValueFormat;
@@ -17,6 +21,8 @@ interface FieldSpec {
   role?: FieldRole;
   /** role=category 专用：类别名称 -> 单选控件选项 id。LLM 选出的名称据此映射为选项 id。 */
   options?: Record<string, string>;
+  /** 两套审批定义的选项不完全一致时，按办理类型分别配置。 */
+  optionsByMode?: Partial<Record<MappingMode, Record<string, string>>>;
 }
 
 interface FieldListSpec {
@@ -34,7 +40,7 @@ interface MappingConfig {
   /** 附件控件：把原始文件（如 PDF）以附件形式填入此控件 */
   attachmentField?: { widgetId: string; widgetType: string };
   /** 合计金额控件（如费用汇总 formula）：填入所有发票金额之和，供条件分流判断 */
-  sumField?: { widgetId: string; widgetType: string };
+  sumField?: { widgetId: string; widgetType: string; modes?: MappingMode[] };
 }
 
 /** LLM/外部生成的覆盖值 */
@@ -94,19 +100,22 @@ function resolveRaw(spec: FieldSpec, invoice: RecognizedInvoice): string | undef
 function resolveCategory(
   spec: FieldSpec,
   invoice: RecognizedInvoice,
-  chosenName?: string
+  chosenName: string | undefined,
+  mode: MappingMode
 ): string | undefined {
-  if (chosenName && spec.options && spec.options[chosenName] != null) return spec.options[chosenName];
+  const options = spec.optionsByMode?.[mode] ?? spec.options;
+  if (chosenName && options && options[chosenName] != null) return options[chosenName];
   if (spec.valueByType && spec.valueByType[invoice.type] != null) return spec.valueByType[invoice.type];
   if (spec.constValue != null) return spec.constValue;
   return undefined;
 }
 
 /** 供上层（LLM 调用方）获取可选的报销类别名称列表；无 category 字段时返回空数组。 */
-export function getCategoryOptionNames(): string[] {
+export function getCategoryOptionNames(mode: MappingMode = 'expense'): string[] {
   const cfg = loadMapping();
-  const field = cfg.fields.find((f) => f.role === 'category' && f.options);
-  return field?.options ? Object.keys(field.options) : [];
+  const field = cfg.fields.find((f) => f.role === 'category' && (f.options || f.optionsByMode));
+  const options = field?.optionsByMode?.[mode] ?? field?.options;
+  return options ? Object.keys(options) : [];
 }
 
 function defaultFormat(widgetType: string): ValueFormat {
@@ -164,7 +173,8 @@ export function buildApprovalForm(
   invoices: RecognizedInvoice[],
   overrides: FormOverrides = {},
   imageCodes: string[] = [],
-  attachmentCodes: string[] = []
+  attachmentCodes: string[] = [],
+  loan?: LoanReference
 ): { form: FormField[]; title: string; categoryLabel?: string } {
   const cfg = loadMapping();
   const form: FormField[] = [];
@@ -173,7 +183,9 @@ export function buildApprovalForm(
   const allSame = invoices.every((v) => v.type === primary.type);
   const aggType = allSame ? primary.type : 'unknown';
   const aggLabel = allSame ? primary.typeLabel : `${invoices.length}张发票`;
-  const aggInvoice: RecognizedInvoice = { ...primary, type: aggType, typeLabel: aggLabel };
+  const mode: MappingMode = loan ? 'loan_writeoff' : 'expense';
+  const loanRaw: Record<string, string> = loan ? { loanApprovedDate: loan.approvedDate, loanAmount: loan.amount || '', loanReason: loan.reason || '', loanSerialNumber: loan.serialNumber, loanInstanceCode: loan.instanceCode } : {};
+  const aggInvoice: RecognizedInvoice = { ...primary, type: aggType, typeLabel: aggLabel, raw: { ...primary.raw, ...loanRaw } };
 
   for (const spec of cfg.fields) {
     if (isPlaceholder(spec.widgetId)) {
@@ -183,10 +195,11 @@ export function buildApprovalForm(
     let value: unknown;
     if (spec.role === 'reason' && overrides.reason) value = overrides.reason;
     else if (spec.role === 'category') {
-      value = resolveCategory(spec, aggInvoice, overrides.category);
+      value = resolveCategory(spec, aggInvoice, overrides.category, mode);
       // 反查实际生效的选项对应的类别名称（供卡片展示，回退时也能得到名称）
-      if (value != null && spec.options) {
-        categoryLabel = Object.keys(spec.options).find((k) => spec.options![k] === value);
+      const options = spec.optionsByMode?.[mode] ?? spec.options;
+      if (value != null && options) {
+        categoryLabel = Object.keys(options).find((k) => options[k] === value);
       }
     } else value = formatValue(spec, aggInvoice);
     if (value === undefined || value === '') continue;
@@ -195,13 +208,14 @@ export function buildApprovalForm(
 
   if (cfg.fieldList && !isPlaceholder(cfg.fieldList.widgetId)) {
     const rows: FormField[][] = [];
-    invoices.forEach((inv, i) => {
+    invoices.forEach((sourceInvoice, i) => {
+      const inv: RecognizedInvoice = { ...sourceInvoice, raw: { ...sourceInvoice.raw, ...loanRaw } };
       const row: FormField[] = [];
       for (const rf of cfg.fieldList!.rowFields) {
         if (isPlaceholder(rf.widgetId)) continue;
         let v: unknown;
         if (rf.role === 'content' && overrides.contents?.[i]) v = overrides.contents[i];
-        else v = formatValue(rf, inv);
+        else v = formatValue(loan && rf.loanSource ? { ...rf, source: rf.loanSource } : rf, inv);
         if (v === undefined || v === '') continue;
         row.push({ id: rf.widgetId, type: rf.widgetType, value: v });
       }
@@ -223,12 +237,12 @@ export function buildApprovalForm(
   }
 
   // 合计金额控件：填入所有发票金额之和（条件分流依据此字段，必须填，否则默认走高限额分支）
-  if (cfg.sumField && !isPlaceholder(cfg.sumField.widgetId)) {
+  if (cfg.sumField && !isPlaceholder(cfg.sumField.widgetId) && (!cfg.sumField.modes || cfg.sumField.modes.includes(mode))) {
     const total = invoices.reduce((s, v) => s + (parseFloat((v.amount || '0').replace(/[^\d.-]/g, '')) || 0), 0);
     form.push({ id: cfg.sumField.widgetId, type: cfg.sumField.widgetType, value: total.toFixed(2) });
   }
 
-  const fallback = `费用报销-${aggLabel}`;
+  const fallback = `借款核销-${aggLabel}`;
   const title = overrides.title
     ? overrides.title
     : cfg.title

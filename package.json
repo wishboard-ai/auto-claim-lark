@@ -2,7 +2,7 @@
   "name": "auto-claim-lark",
   "version": "0.1.0",
   "private": true,
-  "description": "飞书发票报销机器人：发票图片 → OCR 识别 → 自动创建费用报销审批实例（待用户手动提交）",
+  "description": "飞书费用报销与分批借款核销机器人：发票 OCR → 聊天确认 → 自动创建审批",
   "main": "dist/src/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -10,6 +10,7 @@
     "start:local": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test tests/writeoff.test.cjs",
     "inspect:approval": "tsx scripts/inspect-approval.ts"
   },
   "keywords": [

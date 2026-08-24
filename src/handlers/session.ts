@@ -1,4 +1,5 @@
 import { RecognizedInvoice } from '../types';
+import { LoanReference } from '../writeoff/loans';
 
 /**
  * 购物车中的一张发票。
@@ -14,13 +15,18 @@ export interface CartItem {
   /** 原始文件名（含扩展名，用于附件展示） */
   fileName?: string;
 }
+export type ClaimMode = 'loan_writeoff' | 'expense';
 
 /** 一次待提交的报销（可含多张发票） */
 export interface PendingClaim {
   items: CartItem[];
   createdAt: number;
+  mode: ClaimMode;
   /** 进入「提交前预览/待确认」阶段后填充；用户回复「确认」时据此创建审批。 */
   draft?: Draft;
+  loan?: LoanReference;
+  loanCandidates?: LoanReference[];
+  pendingReason?: string;
 }
 
 /** 待确认草稿：LLM 整理出的文案与类别，用户可在确认前修改类别/事由。 */
@@ -45,11 +51,31 @@ export function addItem(openId: string, item: CartItem): PendingClaim {
     existing.items.push(item);
     existing.createdAt = Date.now();
     existing.draft = undefined; // 发票集合已变化，作废旧预览，回到收集阶段
+    existing.loan = undefined;
+    existing.loanCandidates = undefined;
+    existing.pendingReason = undefined;
     return existing;
   }
-  const claim: PendingClaim = { items: [item], createdAt: Date.now() };
+  // 正常流程会先选择模式；兜底按费用报销，避免旧调用方产生无效会话。
+  const claim: PendingClaim = { items: [item], createdAt: Date.now(), mode: 'expense' };
   store.set(openId, claim);
   return claim;
+}
+
+export function startSession(openId: string, mode: ClaimMode): PendingClaim {
+  const claim: PendingClaim = { items: [], createdAt: Date.now(), mode };
+  store.set(openId, claim);
+  return claim;
+}
+
+export function setLoanSelection(openId: string, candidates: LoanReference[], reason: string): void {
+  const c = getPending(openId); if (!c) return;
+  c.loanCandidates = candidates; c.pendingReason = reason; c.createdAt = Date.now();
+}
+
+export function selectLoan(openId: string, loan: LoanReference): void {
+  const c = getPending(openId); if (!c) return;
+  c.loan = loan; c.loanCandidates = undefined; c.pendingReason = undefined; c.createdAt = Date.now();
 }
 
 /** 写入/更新待确认草稿，并刷新有效期（确认等待期间避免过期）。 */

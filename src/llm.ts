@@ -38,7 +38,8 @@ export async function generateContent(
   cfg: AppConfig,
   invoices: RecognizedInvoice[],
   reason?: string,
-  categories?: string[]
+  categories?: string[],
+  workflowName: '借款核销' | '费用报销' = '费用报销'
 ): Promise<GeneratedContent | null> {
   if (!cfg.llm.enabled || invoices.length === 0) return null;
 
@@ -56,13 +57,13 @@ export async function generateContent(
   const reasonText = (reason || '').trim();
 
   const system =
-    '你是企业费用报销助手，负责整理发票信息为规范的报销单文案。严禁编造任何发票中不存在的信息（尤其是用途、事由），只能基于给定字段进行归纳和格式化。只返回严格的 JSON，不要输出解释或额外文字。';
+    `你是企业${workflowName}助手，负责整理实际消费发票为规范的${workflowName}单文案。严禁编造任何发票中不存在的信息，只能基于给定字段进行归纳和格式化。只返回严格的 JSON，不要输出解释或额外文字。`;
 
   const lines: string[] = [];
   lines.push(`发票列表（共 ${invoices.length} 张）：\n${JSON.stringify(items, null, 2)}`);
   if (reasonText) lines.push(`\n员工填写的报销说明/事由：${reasonText}`);
   lines.push(`\n请返回 JSON：`);
-  lines.push(`- "title": 报销单标题，不超过 20 字，概括票据类型与商家，不要编造用途；`);
+  lines.push(`- "title": ${workflowName}单标题，不超过 20 字，概括票据类型与商家，不要编造用途；`);
   lines.push(
     `- "contents": 字符串数组，长度必须等于 ${invoices.length}，与发票顺序一一对应；每项仅根据该发票已有信息（类型/商家/日期/金额）整理成简洁明细，不要编造用途或事由。`
   );
@@ -118,8 +119,11 @@ export async function generateContent(
       if (c && categories!.includes(c)) category = c;
       else if (c) logger.warn(`LLM 返回的类别「${c}」不在允许列表内，忽略并回退默认规则。`);
     }
+    const body = String(parsed.title || '')
+      .trim()
+      .replace(/^(借款核销|费用报销)[-：:\s]*/, '');
     return {
-      title: (String(parsed.title || '').trim() || '费用报销').slice(0, 40),
+      title: `${workflowName}-${body || '发票'}`.slice(0, 40),
       contents,
       category,
     };

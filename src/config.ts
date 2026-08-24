@@ -61,14 +61,24 @@ export interface OcrConfig {
   model: string;
 }
 
+/** 审批通过后累计核销金额、提交前校验剩余额度的本地台账配置。 */
+export interface WriteOffConfig {
+  enabled: boolean;
+  ledgerPath: string;
+  loanApprovalCode: string;
+  lookbackDays: number;
+}
+
 /** 机器人完整运行配置 */
 export interface AppConfig extends Credentials {
   approvalCode: string;
+  expenseApprovalCode: string;
   submitMode: SubmitMode;
   llm: LlmConfig;
   ocr: OcrConfig;
   /** 识别/文案/上传等网络请求的超时(ms)，避免挂起阻塞用户串行队列。0/非法则用默认 120000。 */
   requestTimeoutMs: number;
+  writeOff: WriteOffConfig;
 }
 
 export function loadCredentials(): Credentials {
@@ -107,12 +117,20 @@ export function loadConfig(): AppConfig {
     apiKey: ocrApiKey,
     model: opt('OCR_MODEL', 'qwen-vl-max'),
   };
+  const writeOff: WriteOffConfig = {
+    enabled: ['1', 'true', 'yes', 'on'].includes(opt('LOAN_WRITE_OFF_ENABLED', 'false').toLowerCase()),
+    ledgerPath: opt('LOAN_WRITE_OFF_LEDGER_PATH', 'data/loan-writeoff-ledger.json'),
+    loanApprovalCode: opt('LOAN_APPROVAL_CODE', 'FC505937-DA1D-471E-AC90-13C7AEB306B7'),
+    lookbackDays: Math.max(1, Number(opt('LOAN_LOOKBACK_DAYS', '365')) || 365),
+  };
   return {
     ...creds,
     approvalCode: req('APPROVAL_CODE'),
+    expenseApprovalCode: opt('EXPENSE_APPROVAL_CODE', '08835DC3-456D-4EC8-BC60-D4433588821C'),
     submitMode,
     llm,
     ocr,
     requestTimeoutMs: Math.max(1000, Number(opt('REQUEST_TIMEOUT_MS', '120000')) || 120000),
+    writeOff,
   };
 }

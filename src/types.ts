@@ -17,6 +17,10 @@ export interface RecognizedInvoice {
   buyerName?: string;
   /** 发票号码 / 票号 */
   invoiceNo?: string;
+  /** 发票代码（传统增值税发票常见，与发票号码组合后可唯一识别） */
+  invoiceCode?: string;
+  /** 校验码（用于展示/后续接入税务验真服务，不参与日志输出） */
+  checkCode?: string;
   /** 税额（元） */
   taxAmount?: string;
   /** 摘要说明（如 出发→到达、车次、里程等） */
