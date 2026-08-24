@@ -4,7 +4,7 @@ import { RecognizedInvoice, FormField } from '../types';
 import { logger } from '../logger';
 
 type ValueFormat = 'string' | 'number' | 'date' | 'datetime';
-type FieldRole = 'reason' | 'content' | 'title';
+type FieldRole = 'reason' | 'content' | 'title' | 'category';
 
 interface FieldSpec {
   widgetId: string;
@@ -13,8 +13,10 @@ interface FieldSpec {
   constValue?: string;
   valueByType?: Record<string, string>;
   valueFormat?: ValueFormat;
-  /** 语义角色：可被 LLM 生成结果覆盖（reason=事由, content=明细内容） */
+  /** 语义角色：可被 LLM 生成结果覆盖（reason=事由, content=明细内容, category=报销类别） */
   role?: FieldRole;
+  /** role=category 专用：类别名称 -> 单选控件选项 id。LLM 选出的名称据此映射为选项 id。 */
+  options?: Record<string, string>;
 }
 
 interface FieldListSpec {
@@ -38,6 +40,8 @@ export interface FormOverrides {
   title?: string;
   reason?: string;
   contents?: string[]; // 与 invoices 顺序一致，每张发票的明细内容
+  /** LLM 选出的报销类别名称（须为 category 字段 options 里的一项） */
+  category?: string;
 }
 
 const MAPPING_PATH =
@@ -77,6 +81,30 @@ function resolveRaw(spec: FieldSpec, invoice: RecognizedInvoice): string | undef
   if (spec.constValue != null) return spec.constValue;
   if (spec.source) return pick(invoice, spec.source);
   return undefined;
+}
+
+/**
+ * 解析 role=category 的单选控件值（选项 id）。优先级：
+ *  1) LLM 选出的类别名称 → options[name]（结合发票内容+用户说明，见 llm.ts）；
+ *  2) 回退：按票种的 valueByType[type] 启发式；
+ *  3) 兜底：constValue（通常为「其他」）。
+ */
+function resolveCategory(
+  spec: FieldSpec,
+  invoice: RecognizedInvoice,
+  chosenName?: string
+): string | undefined {
+  if (chosenName && spec.options && spec.options[chosenName] != null) return spec.options[chosenName];
+  if (spec.valueByType && spec.valueByType[invoice.type] != null) return spec.valueByType[invoice.type];
+  if (spec.constValue != null) return spec.constValue;
+  return undefined;
+}
+
+/** 供上层（LLM 调用方）获取可选的报销类别名称列表；无 category 字段时返回空数组。 */
+export function getCategoryOptionNames(): string[] {
+  const cfg = loadMapping();
+  const field = cfg.fields.find((f) => f.role === 'category' && f.options);
+  return field?.options ? Object.keys(field.options) : [];
 }
 
 function defaultFormat(widgetType: string): ValueFormat {
@@ -134,9 +162,10 @@ export function buildApprovalForm(
   invoices: RecognizedInvoice[],
   overrides: FormOverrides = {},
   imageCodes: string[] = []
-): { form: FormField[]; title: string } {
+): { form: FormField[]; title: string; categoryLabel?: string } {
   const cfg = loadMapping();
   const form: FormField[] = [];
+  let categoryLabel: string | undefined;
   const primary = invoices[0];
   const allSame = invoices.every((v) => v.type === primary.type);
   const aggType = allSame ? primary.type : 'unknown';
@@ -150,7 +179,13 @@ export function buildApprovalForm(
     }
     let value: unknown;
     if (spec.role === 'reason' && overrides.reason) value = overrides.reason;
-    else value = formatValue(spec, aggInvoice);
+    else if (spec.role === 'category') {
+      value = resolveCategory(spec, aggInvoice, overrides.category);
+      // 反查实际生效的选项对应的类别名称（供卡片展示，回退时也能得到名称）
+      if (value != null && spec.options) {
+        categoryLabel = Object.keys(spec.options).find((k) => spec.options![k] === value);
+      }
+    } else value = formatValue(spec, aggInvoice);
     if (value === undefined || value === '') continue;
     form.push({ id: spec.widgetId, type: spec.widgetType, value });
   }
@@ -193,5 +228,5 @@ export function buildApprovalForm(
         ? renderTemplate(cfg.title, aggInvoice) || fallback
         : cfg.title
       : fallback;
-  return { form, title };
+  return { form, title, categoryLabel };
 }

@@ -26,10 +26,12 @@
 
 | 模式 | 行为 | 人工关卡 |
 | --- | --- | --- |
-| `confirm`（默认） | 识别后先在聊天中展示结果，用户回复「**确认**」后才创建并提交审批 | ✅ 提交前人工复核 |
+| `confirm`（默认） | 识别后累加到报销单；回复「报销事由」→ 生成**预览卡片**（标题 / 报销类别 / 事由 / 明细）→ 可回复类别名改类别、回复新文字改事由 → 回复「**确认**」后才创建并提交审批 | ✅ 提交前人工复核 |
 | `direct` | 识别后直接创建并提交审批 | ❌ 无 |
 
-> 说明：无论哪种模式，一旦创建，审批即已提交。`confirm` 模式把「人工确认」前置到了聊天里（回复「确认/取消」），这是在 API 限制下最接近「人工把关后再进入审批」的方案。
+> 说明：无论哪种模式，一旦创建，审批即已提交。`confirm` 模式把「人工确认」前置到了聊天里：识别 → 回复事由 → **先预览、可改类别/事由、再回复「确认」才提交**（回复「取消」放弃），这是在 API 限制下最接近「人工把关后再进入审批」的方案。
+>
+> **报销类别**由模型结合「发票内容 + 你填写的事由」自动选择（候选见 `config/field-mapping.json` 的 `options`）；预览时可回复某个类别名直接改写，模型关闭/失败时回退按票种的默认映射。
 >
 > 如果确实需要「打开预填好的审批发起页、由用户点提交」，需改用飞书 **applink 预填发起页** 方案（本项目未内置，可作为后续扩展）。
 
@@ -122,6 +124,36 @@ npm run dev                  # 开发模式（tsx watch 热重载，仅供开发
 > **自更新**：`start.sh` / `start.bat` 每次启动都会 `git pull --ff-only` 拉取最新代码并重装依赖、重新编译；离线或有本地改动时会自动跳过、沿用当前代码。
 
 启动后在飞书里单聊机器人、发送一张发票图片即可。
+
+## 4.4 每天定时检查更新并自动重启（Windows 计划任务）
+
+除了「每次启动时」检查更新外，还可以让机器人**每天早上 08:00 自动检查更新**：有更新就 `git pull` + 装依赖 + 编译，然后**后台重启**机器人；没有更新则不打扰当前实例。
+
+一次性注册（当前用户、登录时运行，无需管理员）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register-daily-update.ps1
+# 自定义时间： -At 07:30 ；移除： -Unregister
+```
+
+- 计划任务名：`AutoClaimLark-DailyUpdate`（可在「任务计划程序」里看到）。
+- 更新逻辑脚本：`scripts\update-and-restart.ps1`
+  - `-CheckOnly` 只检查不改动（测试用）；`-Force` 即使无更新也强制重启一次。
+  - 重启采用**后台运行**（`scripts\run-bot.cmd`，隐藏窗口），输出写入 `logs\bot.out.log`；更新过程写入 `logs\update.log`。
+  - 停止时按命令行匹配 `dist\src\index.js` 定位 node 进程；因此**同一时间只保留一个实例**（若你另开了 `start.bat` 前台窗口，08:00 有更新时会被这个后台实例接管）。
+
+手动跑一次 / 查看状态：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\update-and-restart.ps1        # 立即检查+按需更新重启
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\update-and-restart.ps1 -CheckOnly   # 只看有没有更新
+Get-ScheduledTask -TaskName AutoClaimLark-DailyUpdate | Get-ScheduledTaskInfo               # 下次运行时间等
+```
+
+> 说明：
+> - 任务以「用户已登录」为条件运行；机器需在 08:00 处于开机且已登录状态（错过时间会在可用时补跑）。
+> - 若工作区有**未提交的本地改动**且与远端更新冲突，`git pull --ff-only` 会失败并跳过（沿用当前代码），与 `start.bat` 的自更新行为一致。
+> - 依赖本地 Ollama 时，请确保 Ollama 已随开机自启（安装器默认如此）；后台重启不会再走 `start.bat` 的 Ollama 拉起步骤。
 
 ## 4.1 在 macOS 部署（苹果一体机，含全本地识别）
 

@@ -40,20 +40,28 @@ export function addedCard(invoices: RecognizedInvoice[]): string {
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: list } },
       { tag: 'hr' },
-      { tag: 'div', text: { tag: 'lark_md', content: '继续发送发票图片可累加；回复本次「报销事由」即可提交（如：1月客户拜访交通费），或回复「取消」放弃。' } },
+      { tag: 'div', text: { tag: 'lark_md', content: '继续发送发票图片可累加；回复本次「报销事由」（如：1月客户拜访交通费）后我会生成预览、确认后再提交，或回复「取消」放弃。' } },
     ],
   });
 }
 
 /** 提交成功卡片 */
-export function successCard(invoices: RecognizedInvoice[], link: string | undefined, title: string): string {
+export function successCard(
+  invoices: RecognizedInvoice[],
+  link: string | undefined,
+  title: string,
+  categoryLabel?: string
+): string {
   const list = invoices.map((v, i) => briefLine(v, i + 1)).join('\n');
+  const head = categoryLabel
+    ? `**${title}**\n**报销类别**：${categoryLabel}\n共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}\n\n${list}`
+    : `**${title}**\n共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}\n\n${list}`;
   const elements: Array<Record<string, unknown>> = [
     {
       tag: 'div',
       text: {
         tag: 'lark_md',
-        content: `**${title}**\n共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}\n\n${list}`,
+        content: head,
       },
     },
   ];
@@ -67,5 +75,38 @@ export function successCard(invoices: RecognizedInvoice[], link: string | undefi
     config: { wide_screen_mode: true },
     header: { template: 'green', title: { tag: 'plain_text', content: '费用报销审批已提交' } },
     elements,
+  });
+}
+
+/**
+ * 提交前预览/确认卡片（confirm 模式）：展示标题/类别/事由/明细，等待用户回复「确认」再提交。
+ * 用户也可回复某个类别名改类别、或回复新的事由文字重新整理。
+ */
+export function previewCard(
+  invoices: RecognizedInvoice[],
+  title: string,
+  categoryLabel: string | undefined,
+  reason: string | undefined,
+  categoryNames: string[] = []
+): string {
+  const list = invoices.map((v, i) => briefLine(v, i + 1)).join('\n');
+  const rows = [`**${title}**`];
+  if (categoryLabel) rows.push(`**报销类别**：${categoryLabel}`);
+  if (reason) rows.push(`**报销事由**：${reason}`);
+  rows.push(`共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}`);
+  rows.push('');
+  rows.push(list);
+  const hint =
+    '回复「**确认**」提交审批；回复「**取消**」放弃。\n' +
+    (categoryNames.length ? `如需改类别，回复其中一个名称：${categoryNames.join(' / ')}。\n` : '') +
+    '如需改事由，直接回复新的事由文字，我会重新整理并再次预览。';
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    header: { template: 'orange', title: { tag: 'plain_text', content: '请核对，回复「确认」后提交' } },
+    elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: rows.join('\n') } },
+      { tag: 'hr' },
+      { tag: 'div', text: { tag: 'lark_md', content: hint } },
+    ],
   });
 }

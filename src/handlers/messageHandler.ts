@@ -5,10 +5,10 @@ import { RecognizedInvoice } from '../types';
 import { downloadImage, downloadFile } from '../invoice/download';
 import { pdfFirstPageToImage, extractPdfText, hasUsableText, isPdf } from '../invoice/pdf';
 import { recognizeInvoice, recognizeInvoiceFromText, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
-import { buildApprovalForm, FormOverrides } from '../approval/fieldMapping';
+import { buildApprovalForm, FormOverrides, getCategoryOptionNames } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
-import { addItem, getPending, clearPending, CartItem } from './session';
-import { addedCard, successCard } from '../reply/cards';
+import { addItem, getPending, clearPending, setDraft, CartItem, Draft } from './session';
+import { addedCard, successCard, previewCard } from '../reply/cards';
 import { generateContent } from '../llm';
 import { uploadApprovalImage } from '../approval/uploadImage';
 
@@ -16,7 +16,7 @@ const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '
 const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
 
 const HELP_TEXT =
-  '你好，我是发票报销助手 🧾\n发送发票图片或 PDF（增值税发票 / 火车票 / 出租车票），可连续发送多张累加到同一张报销单；\n发完后直接回复本次「报销事由」即可提交（例如：1月客户拜访交通费），或回复「取消」放弃。';
+  '你好，我是发票报销助手 🧾\n发送发票图片或 PDF（增值税发票 / 火车票 / 出租车票），可连续发送多张累加到同一张报销单；\n发完后回复本次「报销事由」（例如：1月客户拜访交通费），我会生成预览，回复「确认」后再提交，或回复「取消」放弃。';
 
 export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   // 幂等去重
@@ -47,20 +47,36 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     });
   }
 
-  async function createFromItems(
+  function draftToOverrides(draft: Draft): FormOverrides {
+    return { reason: draft.reason, title: draft.title, contents: draft.contents, category: draft.category };
+  }
+
+  /** 计算 LLM 文案与类别，产出待确认草稿（不创建审批）。 */
+  async function buildDraft(items: CartItem[], reason: string): Promise<Draft> {
+    const invoices = items.map((i) => i.invoice);
+    const gen = await generateContent(cfg, invoices, reason, getCategoryOptionNames());
+    if (gen) {
+      logger.info(`LLM 生成标题：${gen.title}`);
+      if (gen.category) logger.info(`LLM 选择报销类别：${gen.category}`);
+    }
+    return { reason, title: gen?.title, contents: gen?.contents, category: gen?.category };
+  }
+
+  /** 展示「提交前预览/确认」卡片（不创建审批）。 */
+  async function showPreview(chatId: string, items: CartItem[], draft: Draft): Promise<void> {
+    const invoices = items.map((i) => i.invoice);
+    const { title, categoryLabel } = buildApprovalForm(invoices, draftToOverrides(draft), []);
+    await sendCard(chatId, previewCard(invoices, title, categoryLabel, draft.reason, getCategoryOptionNames()));
+  }
+
+  /** 用草稿实际创建审批：上传图片 → 构建表单 → 创建 → 回复结果卡片。 */
+  async function submitDraft(
     chatId: string,
     openId: string,
     items: CartItem[],
-    reason: string
+    draft: Draft
   ): Promise<void> {
     const invoices = items.map((i) => i.invoice);
-    const overrides: FormOverrides = { reason };
-    const gen = await generateContent(cfg, invoices);
-    if (gen) {
-      overrides.title = gen.title;
-      overrides.contents = gen.contents;
-      logger.info(`LLM 生成标题：${gen.title}`);
-    }
     // 上传发票原图，收集文件 code 填入「图片」控件（失败不阻断）
     const imageCodes: string[] = [];
     for (const it of items) {
@@ -69,7 +85,7 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
         if (code) imageCodes.push(code);
       }
     }
-    const { form, title } = buildApprovalForm(invoices, overrides, imageCodes);
+    const { form, title, categoryLabel } = buildApprovalForm(invoices, draftToOverrides(draft), imageCodes);
     if (form.length === 0) {
       await sendText(
         chatId,
@@ -79,7 +95,7 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     }
     try {
       const { instanceLink } = await createApprovalInstance(client, cfg, openId, form, title);
-      await sendCard(chatId, successCard(invoices, instanceLink, title));
+      await sendCard(chatId, successCard(invoices, instanceLink, title, categoryLabel));
     } catch (e) {
       logger.error('创建审批失败', e);
       await sendText(chatId, `创建审批失败：${(e as Error).message}`);
@@ -215,7 +231,8 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       ? { invoice, imageBuffer, imageExt: imgExt(imageBuffer) }
       : { invoice };
     if (cfg.submitMode === 'direct') {
-      await createFromItems(chatId, openId, [item], '');
+      const draft = await buildDraft([item], '');
+      await submitDraft(chatId, openId, [item], draft);
     } else {
       const claim = addItem(openId, item);
       await sendCard(chatId, addedCard(claim.items.map((i) => i.invoice)));
@@ -240,14 +257,38 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       await sendText(chatId, HELP_TEXT);
       return;
     }
-    if (CONFIRM_WORDS.includes(lower) || raw === '') {
-      await sendText(chatId, '请直接回复本次报销的事由（例如：1月客户拜访交通费），我将据此创建并提交报销单。');
+
+    // 阶段二：已生成预览，等待「确认」或修改
+    if (pending.draft) {
+      if (CONFIRM_WORDS.includes(lower)) {
+        const items = pending.items;
+        const draft = pending.draft;
+        clearPending(openId);
+        await submitDraft(chatId, openId, items, draft);
+        return;
+      }
+      // 回复某个合法类别名 → 仅改类别并重新预览（无需再调用 LLM）
+      if (getCategoryOptionNames().includes(raw)) {
+        const draft: Draft = { ...pending.draft, category: raw };
+        setDraft(openId, draft);
+        await showPreview(chatId, pending.items, draft);
+        return;
+      }
+      // 其他文字 → 作为新的报销事由，重新整理并再次预览
+      const draft = await buildDraft(pending.items, raw);
+      setDraft(openId, draft);
+      await showPreview(chatId, pending.items, draft);
       return;
     }
-    // 用户输入的文本即为报销事由
-    const items = pending.items;
-    clearPending(openId);
-    await createFromItems(chatId, openId, items, raw);
+
+    // 阶段一：收集完成，首次回复事由 → 生成预览（不直接提交）
+    if (CONFIRM_WORDS.includes(lower) || raw === '') {
+      await sendText(chatId, '请先回复本次报销的事由（例如：1月客户拜访交通费），我会生成预览，确认后再提交。');
+      return;
+    }
+    const draft = await buildDraft(pending.items, raw);
+    setDraft(openId, draft);
+    await showPreview(chatId, pending.items, draft);
   }
 
   async function onChatEntered(event: any): Promise<void> {
