@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  每天 08:00 检查更新并按需重启机器人（对应 Windows 的计划任务 AutoClaimLark-DailyUpdate）。
+  安装：
+    1) 把 {{PROJECT_DIR}} 替换为仓库绝对路径（如 /Applications/auto-claim-lark）
+    2) chmod +x {{PROJECT_DIR}}/scripts/update-and-restart.sh
+    3) cp 本文件到 ~/Library/LaunchAgents/com.autoclaim.lark.dailyupdate.plist
+    4) launchctl load -w ~/Library/LaunchAgents/com.autoclaim.lark.dailyupdate.plist
+  说明：有更新才重启（重启经 start.sh 自动 git pull + 编译 + 运行）；无更新不打扰。
+        机器需在 08:00 处于开机/唤醒状态；睡眠错过时会在唤醒后补跑。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.autoclaim.lark.dailyupdate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{{PROJECT_DIR}}/scripts/update-and-restart.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>8</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{{PROJECT_DIR}}/logs/dailyupdate.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{PROJECT_DIR}}/logs/dailyupdate.launchd.log</string>
+</dict>
+</plist>
