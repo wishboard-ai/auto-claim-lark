@@ -34,6 +34,19 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   const welcomed = new Map<string, number>();
   const WELCOME_TTL_MS = 30 * 60 * 1000;
 
+  // 每个用户一条串行队列：消息按「到达顺序」逐条处理，不同用户之间仍并行。
+  // 作用：① 多张发票严格按发送顺序累加；② 避免「报销事由」抢在图片识别完成前被处理
+  //      （否则会误判为无待办报销单而回复帮助语，导致对话像被“中断”）。
+  const userChains = new Map<string, Promise<void>>();
+  function enqueue(key: string, task: () => Promise<void>): void {
+    const prev = userChains.get(key) ?? Promise.resolve();
+    const next = prev.catch(() => undefined).then(task);
+    userChains.set(key, next);
+    void next.finally(() => {
+      if (userChains.get(key) === next) userChains.delete(key);
+    });
+  }
+
   async function sendCard(chatId: string, card: string): Promise<void> {
     await client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
@@ -317,9 +330,11 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       return;
     }
 
-    // 立即返回以在 3 秒内完成 ack；下载/识别/上传/创建等重活放到后台执行，
-    // 避免长连接超时(>3s)重推、进而重复处理（如凭空冒出"已加入报销"）。
-    void (async () => {
+    // 立即返回以在 3 秒内完成 ack；实际处理进入「每用户串行队列」按到达顺序执行。
+    // 既避免长连接超时(>3s)重推重复处理，又保证顺序：事由不会抢在图片识别完成前处理、
+    // 多张发票严格按发送顺序累加。
+    const key = openId || chatId;
+    enqueue(key, async () => {
       try {
         if (msgType === 'image') {
           await handleImage(chatId, openId, messageId, message.content);
@@ -328,6 +343,9 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
         } else if (msgType === 'text') {
           await handleText(chatId, openId, message.content);
         } else {
+          logger.warn(
+            `收到未支持的消息类型 message_type=${msgType}；content=${String(message?.content ?? '').slice(0, 300)}`
+          );
           await sendText(chatId, '请发送发票图片或 PDF（增值税发票 / 火车票 / 出租车票）。');
         }
       } catch (e) {
@@ -338,7 +356,7 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
           /* 忽略二次失败 */
         }
       }
-    })();
+    });
   }
 
   return { onMessage, onChatEntered };
