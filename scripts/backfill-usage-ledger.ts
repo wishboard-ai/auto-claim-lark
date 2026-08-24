@@ -144,7 +144,22 @@ async function main(): Promise<void> {
     ledger = { version: 1, entries: parsed.entries };
   }
   const existing = new Set(ledger.entries.map((e) => e.fingerprint));
-  const added: Entry[] = [];
+  const doneInstances = new Set(
+    ledger.entries.map((e) => e.approvalInstanceCode).filter((c): c is string => !!c)
+  );
+  let addedCount = 0;
+  let backedUp = false;
+  const flush = (): void => {
+    if (!write) return;
+    fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+    if (!backedUp && fs.existsSync(ledgerPath)) {
+      fs.copyFileSync(ledgerPath, `${ledgerPath}.bak.${Date.now()}`);
+      backedUp = true;
+    }
+    const tmp = `${ledgerPath}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(ledger, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, ledgerPath);
+  };
 
   const report = {
     instances: 0,
@@ -155,6 +170,7 @@ async function main(): Promise<void> {
     inScope: 0,
     totalUrls: 0,
     nonInvoice: 0,
+    resumeSkipped: 0,
   };
 
   console.log(
@@ -167,6 +183,10 @@ async function main(): Promise<void> {
     console.log(`  实例数：${codes.length}`);
     for (const code of codes) {
       report.instances++;
+      if (doneInstances.has(code)) {
+        report.resumeSkipped++;
+        continue;
+      }
       const detail = (await client.approval.v4.instance.get({ path: { instance_id: code } })) as {
         data?: { status?: string; form?: string; open_id?: string; user_id?: string; start_time?: string; end_time?: string };
       };
@@ -187,6 +207,7 @@ async function main(): Promise<void> {
       const openId = d.open_id || d.user_id || '';
       const createdAt = isoTime(d.start_time);
       const submittedAt = isoTime(d.end_time || d.start_time);
+      const beforeAdd = addedCount;
       for (const url of urls) {
         try {
           const buf = await download(url, cfg);
@@ -202,7 +223,7 @@ async function main(): Promise<void> {
             continue;
           }
           existing.add(fp);
-          added.push({
+          ledger.entries.push({
             fingerprint: fp,
             description: describeInvoice(inv),
             status: 'submitted',
@@ -213,12 +234,14 @@ async function main(): Promise<void> {
             approvalInstanceCode: code,
             submittedAt,
           });
+          addedCount++;
           console.log(`    [新增] ${describeInvoice(inv)}  fp=${fp.slice(0, 48)}`);
         } catch (e) {
           report.recogFail++;
           console.log(`    [失败] ${code}: ${(e as Error).message}`);
         }
       }
+      if (write && addedCount > beforeAdd) flush(); // 增量落盘，支持断点续跑
     }
   }
 
@@ -235,26 +258,18 @@ async function main(): Promise<void> {
     return;
   }
 
+  console.log(`断点续跑跳过(已在台账的实例)：${report.resumeSkipped}`);
   console.log(`非发票/未知票种（已跳过，如支付截图）：${report.nonInvoice}`);
   console.log(`下载/识别失败：${report.recogFail}`);
   console.log(`重复跳过（已在台账）：${report.dupSkip}`);
-  console.log(`可新增指纹：${added.length}`);
+  console.log(`本次新增指纹：${addedCount}（台账现共 ${ledger.entries.length} 条）`);
 
   if (!write) {
-    console.log(`\n[dry-run] 未写入。确认无误后加 --write 落台账。`);
+    console.log(`\n[dry-run] 未写入。确认无误后加 --write 落台账（增量落盘，可断点续跑）。`);
     return;
   }
-  if (added.length === 0) {
-    console.log('\n无新增，台账不变。');
-    return;
-  }
-  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
-  if (fs.existsSync(ledgerPath)) fs.copyFileSync(ledgerPath, `${ledgerPath}.bak.${Date.now()}`);
-  ledger.entries.push(...added);
-  const tmp = `${ledgerPath}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(ledger, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, ledgerPath);
-  console.log(`\n[已写入] 新增 ${added.length} 条 -> ${ledgerPath}（原文件已备份）`);
+  flush();
+  console.log(`\n[已写入] 本次新增 ${addedCount} 条 -> ${ledgerPath}（原文件已备份，增量落盘、可断点续跑）`);
 }
 
 main().catch((e: unknown) => {
