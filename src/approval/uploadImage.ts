@@ -1,6 +1,7 @@
 import * as lark from '@larksuiteoapi/node-sdk';
 import { AppConfig } from '../config';
 import { logger } from '../logger';
+import { fetchWithTimeout } from '../util/http';
 
 let cachedToken: { token: string; expireAt: number } | null = null;
 
@@ -10,11 +11,15 @@ function apiBase(cfg: AppConfig): string {
 
 async function getTenantToken(cfg: AppConfig): Promise<string> {
   if (cachedToken && Date.now() < cachedToken.expireAt) return cachedToken.token;
-  const r = await fetch(`${apiBase(cfg)}/open-apis/auth/v3/tenant_access_token/internal`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ app_id: cfg.appId, app_secret: cfg.appSecret }),
-  });
+  const r = await fetchWithTimeout(
+    `${apiBase(cfg)}/open-apis/auth/v3/tenant_access_token/internal`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: cfg.appId, app_secret: cfg.appSecret }),
+    },
+    cfg.requestTimeoutMs
+  );
   const d: any = await r.json();
   if (!d?.tenant_access_token) throw new Error(`获取 tenant_access_token 失败：${d?.msg ?? r.status}`);
   cachedToken = { token: d.tenant_access_token, expireAt: Date.now() + Math.max(60, (d.expire ?? 7200) - 120) * 1000 };
@@ -37,11 +42,15 @@ export async function uploadApprovalImage(
     fd.append('name', filename);
     fd.append('type', 'image');
     fd.append('content', new Blob([new Uint8Array(buffer)], { type: 'image/*' }), filename);
-    const r = await fetch(`${apiBase(cfg)}/approval/openapi/v2/file/upload`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: fd,
-    });
+    const r = await fetchWithTimeout(
+      `${apiBase(cfg)}/approval/openapi/v2/file/upload`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: fd,
+      },
+      cfg.requestTimeoutMs
+    );
     const d: any = await r.json();
     if (d?.code !== 0 || !d?.data?.code) {
       logger.warn(`审批图片上传失败：${JSON.stringify(d).slice(0, 200)}`);

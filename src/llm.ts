@@ -1,6 +1,7 @@
 import { AppConfig } from './config';
 import { RecognizedInvoice } from './types';
 import { logger } from './logger';
+import { fetchWithTimeout } from './util/http';
 
 export interface GeneratedContent {
   title: string;
@@ -79,21 +80,25 @@ export async function generateContent(
   const user = lines.join('\n');
 
   try {
-    const resp = await fetch(`${cfg.llm.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cfg.llm.apiKey}`,
+    const resp = await fetchWithTimeout(
+      `${cfg.llm.baseUrl.replace(/\/$/, '')}/chat/completions`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${cfg.llm.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: cfg.llm.model,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+          temperature: 0.2,
+        }),
       },
-      body: JSON.stringify({
-        model: cfg.llm.model,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-        temperature: 0.2,
-      }),
-    });
+      cfg.requestTimeoutMs
+    );
     if (!resp.ok) {
       logger.warn(`LLM 调用失败 HTTP ${resp.status}：${(await resp.text().catch(() => '')).slice(0, 200)}`);
       return null;

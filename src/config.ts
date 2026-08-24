@@ -67,6 +67,8 @@ export interface AppConfig extends Credentials {
   submitMode: SubmitMode;
   llm: LlmConfig;
   ocr: OcrConfig;
+  /** 识别/文案/上传等网络请求的超时(ms)，避免挂起阻塞用户串行队列。0/非法则用默认 120000。 */
+  requestTimeoutMs: number;
 }
 
 export function loadCredentials(): Credentials {
@@ -111,5 +113,6 @@ export function loadConfig(): AppConfig {
     submitMode,
     llm,
     ocr,
+    requestTimeoutMs: Math.max(1000, Number(opt('REQUEST_TIMEOUT_MS', '120000')) || 120000),
   };
 }

@@ -1,6 +1,7 @@
 import { AppConfig } from '../config';
 import { InvoiceType, RecognizedInvoice } from '../types';
 import { logger } from '../logger';
+import { fetchWithTimeout } from '../util/http';
 
 /**
  * 发票识别。支持两种后端（OCR_PROVIDER）：
@@ -278,11 +279,15 @@ async function openAIChatToInvoice(cfg: AppConfig, content: unknown): Promise<Re
     temperature: 0,
   });
   const postChat = () =>
-    fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ocr.apiKey}` },
-      body,
-    });
+    fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ocr.apiKey}` },
+        body,
+      },
+      cfg.requestTimeoutMs
+    );
 
   let resp: Response;
   try {
@@ -336,12 +341,16 @@ async function recognizeViaPaddle(cfg: AppConfig, file: Buffer): Promise<Recogni
 
   let resp: Response;
   try {
-    resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': mimeForImage(file) },
-      // Node 原生 fetch 接受 Uint8Array 作为 body；用 any 规避 DOM BodyInit 类型缺失
-      body: new Uint8Array(file) as any,
-    });
+    resp = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': mimeForImage(file) },
+        // Node 原生 fetch 接受 Uint8Array 作为 body；用 any 规避 DOM BodyInit 类型缺失
+        body: new Uint8Array(file) as any,
+      },
+      cfg.requestTimeoutMs
+    );
   } catch (e) {
     logger.warn('本地 PaddleOCR 服务连接失败：', (e as Error).message);
     throw new Error(
@@ -372,11 +381,15 @@ async function recognizeTextViaPaddle(cfg: AppConfig, text: string): Promise<Rec
 
   let resp: Response;
   try {
-    resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
+    resp = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      },
+      cfg.requestTimeoutMs
+    );
   } catch (e) {
     logger.warn('本地 PaddleOCR 服务连接失败：', (e as Error).message);
     throw new Error(
