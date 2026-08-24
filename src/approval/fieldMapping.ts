@@ -31,6 +31,8 @@ interface MappingConfig {
   fieldList?: FieldListSpec;
   /** 图片控件：把发票原图 url 填入此控件 */
   imageField?: { widgetId: string; widgetType: string };
+  /** 附件控件：把原始文件（如 PDF）以附件形式填入此控件 */
+  attachmentField?: { widgetId: string; widgetType: string };
   /** 合计金额控件（如费用汇总 formula）：填入所有发票金额之和，供条件分流判断 */
   sumField?: { widgetId: string; widgetType: string };
 }
@@ -161,7 +163,8 @@ function isPlaceholder(widgetId?: string): boolean {
 export function buildApprovalForm(
   invoices: RecognizedInvoice[],
   overrides: FormOverrides = {},
-  imageCodes: string[] = []
+  imageCodes: string[] = [],
+  attachmentCodes: string[] = []
 ): { form: FormField[]; title: string; categoryLabel?: string } {
   const cfg = loadMapping();
   const form: FormField[] = [];
@@ -212,6 +215,11 @@ export function buildApprovalForm(
   // 图片控件：填入发票原图文件 code 数组（必须是 code，不能是 url）
   if (cfg.imageField && !isPlaceholder(cfg.imageField.widgetId) && imageCodes.length > 0) {
     form.push({ id: cfg.imageField.widgetId, type: cfg.imageField.widgetType, value: imageCodes });
+  }
+
+  // 附件控件：填入原始文件（如 PDF）的文件 code 数组（与图片控件同为 code 数组）
+  if (cfg.attachmentField && !isPlaceholder(cfg.attachmentField.widgetId) && attachmentCodes.length > 0) {
+    form.push({ id: cfg.attachmentField.widgetId, type: cfg.attachmentField.widgetType, value: attachmentCodes });
   }
 
   // 合计金额控件：填入所有发票金额之和（条件分流依据此字段，必须填，否则默认走高限额分支）

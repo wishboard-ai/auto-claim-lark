@@ -1,10 +1,18 @@
 import { RecognizedInvoice } from '../types';
 
-/** 购物车中的一张发票（含原图，便于后续上传到审批图片栏） */
+/**
+ * 购物车中的一张发票。
+ * - 图片消息：存 imageBuffer(+imageExt)，提交时上传到审批「图片」控件。
+ * - PDF 消息：存 fileBuffer(+fileName)，提交时以附件上传到审批「附件」控件。
+ */
 export interface CartItem {
   invoice: RecognizedInvoice;
   imageBuffer?: Buffer;
   imageExt?: string;
+  /** 原始文件字节（如 PDF），用于上传到「附件」控件 */
+  fileBuffer?: Buffer;
+  /** 原始文件名（含扩展名，用于附件展示） */
+  fileName?: string;
 }
 
 /** 一次待提交的报销（可含多张发票） */

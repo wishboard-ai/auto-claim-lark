@@ -10,7 +10,7 @@ import { createApprovalInstance } from '../approval/submit';
 import { addItem, getPending, clearPending, setDraft, CartItem, Draft } from './session';
 import { addedCard, successCard, previewCard } from '../reply/cards';
 import { generateContent } from '../llm';
-import { uploadApprovalImage } from '../approval/uploadImage';
+import { uploadApprovalFile } from '../approval/uploadImage';
 
 const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '好'];
 const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
@@ -90,15 +90,25 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     draft: Draft
   ): Promise<void> {
     const invoices = items.map((i) => i.invoice);
-    // 上传发票原图，收集文件 code 填入「图片」控件（失败不阻断）
+    // 上传素材：图片 → 「图片」控件；原始 PDF → 「附件」控件（失败不阻断）
     const imageCodes: string[] = [];
+    const attachmentCodes: string[] = [];
     for (const it of items) {
       if (it.imageBuffer) {
-        const code = await uploadApprovalImage(cfg, it.imageBuffer, `invoice.${it.imageExt || 'jpg'}`);
+        const code = await uploadApprovalFile(cfg, it.imageBuffer, `invoice.${it.imageExt || 'jpg'}`, 'image');
         if (code) imageCodes.push(code);
       }
+      if (it.fileBuffer) {
+        const code = await uploadApprovalFile(cfg, it.fileBuffer, it.fileName || 'invoice.pdf', 'attachment');
+        if (code) attachmentCodes.push(code);
+      }
     }
-    const { form, title, categoryLabel } = buildApprovalForm(invoices, draftToOverrides(draft), imageCodes);
+    const { form, title, categoryLabel } = buildApprovalForm(
+      invoices,
+      draftToOverrides(draft),
+      imageCodes,
+      attachmentCodes
+    );
     if (form.length === 0) {
       await sendText(
         chatId,
@@ -155,37 +165,32 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     }
 
     // 优先读取 PDF 文字层：文本型 PDF 直接按文本识别（更快/更省/更准，无需栅格化）。
+    // 注意：原始 PDF 作为「附件」提交；栅格化仅在无文字层时用于识别、不作为提交内容。
     const pdfText = await extractPdfText(fileBuf);
     let invoice: RecognizedInvoice | null;
-    let attachImage: Buffer | undefined;
 
     if (hasUsableText(pdfText)) {
       logger.info(`PDF 含文字层（${pdfText.replace(/\s+/g, '').length} 字），按文本识别…`);
       invoice = await recognizeGuarded(chatId, () => recognizeInvoiceFromText(cfg, pdfText));
-      if (!invoice) return;
-      // 附件图片为可选：本地栅格化首页用于审批「图片」控件（无 API 成本，失败不阻断）。
-      attachImage = await pdfFirstPageToImage(fileBuf).catch((e) => {
-        logger.warn('PDF 栅格化（附件用）失败，跳过附件：', (e as Error).message);
-        return undefined;
-      });
     } else {
-      // 无文字层（扫描件/图片型 PDF）→ 栅格化首页走视觉识别。
+      // 无文字层（扫描件/图片型 PDF）→ 栅格化首页仅用于视觉识别（不上传）。
       logger.info('PDF 无可用文字层，栅格化首页后走视觉识别…');
       let imageBuf: Buffer;
       try {
         imageBuf = await pdfFirstPageToImage(fileBuf);
-        logger.info(`PDF 已转为图片：${imageBuf.length} 字节`);
+        logger.info(`PDF 已转为图片用于识别：${imageBuf.length} 字节`);
       } catch (e) {
         logger.error('PDF 转图片失败', e);
         await sendText(chatId, `PDF 解析失败：${(e as Error).message}\n可尝试改发发票截图/图片。`);
         return;
       }
       invoice = await recognizeGuarded(chatId, () => recognizeInvoice(cfg, imageBuf));
-      if (!invoice) return;
-      attachImage = imageBuf;
     }
+    if (!invoice) return;
 
-    await finalizeInvoice(chatId, openId, invoice, attachImage);
+    // 原始 PDF 以「附件」形式进入审批（不进图片控件）。
+    const attachName = /\.pdf$/i.test(fileName) ? fileName : 'invoice.pdf';
+    await finalizeInvoice(chatId, openId, invoice, { fileBuffer: fileBuf, fileName: attachName });
   }
 
   /** 识别一张发票图片并按模式加入报销单 / 直接创建（图片消息用）。 */
@@ -196,7 +201,7 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
   ): Promise<void> {
     const invoice = await recognizeGuarded(chatId, () => recognizeInvoice(cfg, buffer));
     if (!invoice) return;
-    await finalizeInvoice(chatId, openId, invoice, buffer);
+    await finalizeInvoice(chatId, openId, invoice, { imageBuffer: buffer });
   }
 
   /** 执行识别并处理额度/未配置类错误（已处理则回复并返回 null，交由上层中止）。 */
@@ -225,12 +230,13 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
     }
   }
 
-  /** 识别结果落地：校验 → 按模式加入报销单或直接创建。imageBuffer 用于审批附件（可选）。 */
+  /** 识别结果落地：校验 → 按模式加入报销单或直接创建。
+   *  media：图片消息给 imageBuffer（进「图片」控件）；PDF 给 fileBuffer+fileName（进「附件」控件）。 */
   async function finalizeInvoice(
     chatId: string,
     openId: string | undefined,
     invoice: RecognizedInvoice,
-    imageBuffer?: Buffer
+    media?: { imageBuffer?: Buffer; fileBuffer?: Buffer; fileName?: string }
   ): Promise<void> {
     if (invoice.type === 'unknown') {
       await sendText(chatId, '未能识别其中的发票信息，请确认是清晰的增值税发票 / 火车票 / 出租车票（图片或 PDF）。');
@@ -240,9 +246,15 @@ export function makeMessageHandler(client: lark.Client, cfg: AppConfig) {
       await sendText(chatId, '无法获取你的用户身份（open_id），无法发起审批。');
       return;
     }
-    const item: CartItem = imageBuffer
-      ? { invoice, imageBuffer, imageExt: imgExt(imageBuffer) }
-      : { invoice };
+    const item: CartItem = { invoice };
+    if (media?.imageBuffer) {
+      item.imageBuffer = media.imageBuffer;
+      item.imageExt = imgExt(media.imageBuffer);
+    }
+    if (media?.fileBuffer) {
+      item.fileBuffer = media.fileBuffer;
+      item.fileName = media.fileName;
+    }
     if (cfg.submitMode === 'direct') {
       const draft = await buildDraft([item], '');
       await submitDraft(chatId, openId, [item], draft);
