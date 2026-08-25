@@ -16,7 +16,7 @@ async function main(): Promise<void> {
   const ledger = cfg.writeOff.enabled ? new LoanWriteOffLedger(cfg.writeOff.ledgerPath) : undefined;
   const invoiceUsageLedger = new InvoiceUsageLedger(cfg.invoiceUsageLedgerPath);
   const { onMessage, onChatEntered } = makeMessageHandler(client, cfg, ledger, invoiceUsageLedger);
-  const onApprovalStatus = makeApprovalStatusHandler(client, cfg, ledger);
+  const onApprovalStatus = makeApprovalStatusHandler(client, cfg, ledger, invoiceUsageLedger);
 
   await ensureApprovalStatusSubscription(client, cfg);
 

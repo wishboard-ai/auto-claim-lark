@@ -118,6 +118,47 @@ export class InvoiceUsageLedger {
     return entry ? { ...entry } : undefined;
   }
 
+  /** 该审批实例是否已在台账中登记过（用于外部审批扫描去重、并跳过机器人自建实例）。 */
+  hasInstance(instanceCode: string): boolean {
+    return this.data.entries.some((item) => item.approvalInstanceCode === instanceCode);
+  }
+
+  /**
+   * 直接以「已提交」写入一批发票，用于「非机器人直接发起的审批」扫描入账。
+   * 按指纹去重（已存在则跳过），跳过未识别票据；返回本次新增条数。
+   */
+  ingestSubmitted(
+    invoices: RecognizedInvoice[],
+    mode: ClaimMode,
+    applicantOpenId: string,
+    instanceCode: string,
+    times?: { createdAt?: string; submittedAt?: string }
+  ): number {
+    const reservationId = `external:${instanceCode}`;
+    const createdAt = times?.createdAt || new Date().toISOString();
+    const submittedAt = times?.submittedAt || createdAt;
+    let added = 0;
+    for (const invoice of invoices) {
+      if (invoice.type === 'unknown') continue;
+      const fingerprint = invoiceFingerprint(invoice);
+      if (this.data.entries.some((item) => item.fingerprint === fingerprint)) continue;
+      this.data.entries.push({
+        fingerprint,
+        description: describeInvoice(invoice),
+        status: 'submitted',
+        reservationId,
+        mode,
+        applicantOpenId,
+        createdAt,
+        approvalInstanceCode: instanceCode,
+        submittedAt,
+      });
+      added++;
+    }
+    if (added > 0) this.save();
+    return added;
+  }
+
   /** 原子校验一批发票并占用；创建审批失败时必须调用 release。 */
   reserve(invoices: RecognizedInvoice[], mode: ClaimMode, applicantOpenId: string): string {
     const seen = new Set<string>();

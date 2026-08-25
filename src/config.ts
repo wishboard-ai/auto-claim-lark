@@ -69,6 +69,18 @@ export interface WriteOffConfig {
   lookbackDays: number;
 }
 
+/**
+ * 外部审批发票扫描：监听「非机器人直接在飞书发起」的费用报销/借款核销审批，
+ * 在实例创建(PENDING)/通过(APPROVED)时下载表单里的发票、OCR、写入检重台账。
+ * - scopeType：飞书审批实例事件订阅范围。
+ *     INVOLVED_APPROVAL —— 订阅范围内审批定义下的全部实例（含他人直接发起，本功能所需）；
+ *     MANAGED_APPROVAL  —— 仅本应用通过 OpenAPI 创建的实例（关闭本功能时的默认范围）。
+ */
+export interface InvoiceScanConfig {
+  enabled: boolean;
+  scopeType: 'INVOLVED_APPROVAL' | 'MANAGED_APPROVAL';
+}
+
 /** 机器人完整运行配置 */
 export interface AppConfig extends Credentials {
   approvalCode: string;
@@ -80,6 +92,7 @@ export interface AppConfig extends Credentials {
   requestTimeoutMs: number;
   writeOff: WriteOffConfig;
   invoiceUsageLedgerPath: string;
+  invoiceScan: InvoiceScanConfig;
 }
 
 export function loadCredentials(): Credentials {
@@ -124,6 +137,12 @@ export function loadConfig(): AppConfig {
     loanApprovalCode: opt('LOAN_APPROVAL_CODE', 'FC505937-DA1D-471E-AC90-13C7AEB306B7'),
     lookbackDays: Math.max(1, Number(opt('LOAN_LOOKBACK_DAYS', '365')) || 365),
   };
+  const invoiceScan: InvoiceScanConfig = {
+    enabled: ['1', 'true', 'yes', 'on'].includes(opt('EXTERNAL_INVOICE_SCAN_ENABLED', 'false').toLowerCase()),
+    scopeType: opt('EXTERNAL_INVOICE_SCAN_SCOPE', 'INVOLVED_APPROVAL').toUpperCase() === 'MANAGED_APPROVAL'
+      ? 'MANAGED_APPROVAL'
+      : 'INVOLVED_APPROVAL',
+  };
   return {
     ...creds,
     approvalCode: req('APPROVAL_CODE'),
@@ -134,5 +153,6 @@ export function loadConfig(): AppConfig {
     requestTimeoutMs: Math.max(1000, Number(opt('REQUEST_TIMEOUT_MS', '120000')) || 120000),
     writeOff,
     invoiceUsageLedgerPath: opt('INVOICE_USAGE_LEDGER_PATH', 'data/invoice-usage-ledger.json'),
+    invoiceScan,
   };
 }
