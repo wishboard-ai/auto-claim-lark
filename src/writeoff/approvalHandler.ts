@@ -71,11 +71,16 @@ export function makeApprovalStatusHandler(
 
     // A) 外部审批发票扫描：监听「非机器人直接发起」的费用报销/借款核销审批，
     //    在创建(PENDING)/通过(APPROVED)时把表单里的发票补入检重台账（幂等）。
-    if (cfg.invoiceScan.enabled && invoiceUsageLedger && SCAN_STATUSES.has(status)) {
+    if (cfg.invoiceScan.enabled && invoiceUsageLedger) {
       let mode: ClaimMode | undefined;
       if (data.approval_code === cfg.expenseApprovalCode) mode = 'expense';
       else if (data.approval_code === cfg.approvalCode) mode = 'loan_writeoff';
-      if (mode) await scanExternalInvoices(data.instance_code, mode);
+      if (mode) {
+        logger.info(
+          `收到审批状态事件（approval=${data.approval_code}, status=${status}, instance=${data.instance_code}）`
+        );
+        if (SCAN_STATUSES.has(status)) await scanExternalInvoices(data.instance_code, mode);
+      }
     }
 
     // B) 借款核销台账维护：仅针对借款核销审批定义、且启用了自动核销时生效。
@@ -115,34 +120,49 @@ export async function ensureApprovalStatusSubscription(
 ): Promise<void> {
   const scanEnabled = cfg.invoiceScan.enabled;
   if (!cfg.writeOff.enabled && !scanEnabled) return;
-  try {
-    // 需要订阅的审批定义：借款核销（自动核销/扫描）+ 费用报销（仅扫描时需要）。
-    const codes = new Set<string>();
-    if (cfg.writeOff.enabled || scanEnabled) codes.add(cfg.approvalCode);
-    if (scanEnabled) codes.add(cfg.expenseApprovalCode);
 
-    for (const code of codes) {
-      const approvalResponse = await client.approval.v4.approval.subscribe({
-        path: { approval_code: code },
-      });
-      if (typeof approvalResponse.code === 'number' && approvalResponse.code !== 0) {
-        throw new Error(`订阅审批定义 ${code} 失败 code=${approvalResponse.code} msg=${approvalResponse.msg}`);
+  // 需要订阅的审批定义：借款核销（自动核销/扫描）+ 费用报销（仅扫描时需要）。
+  const codes = new Set<string>();
+  if (cfg.writeOff.enabled || scanEnabled) codes.add(cfg.approvalCode);
+  if (scanEnabled) codes.add(cfg.expenseApprovalCode);
+
+  const errBody = (e: unknown): { code?: number; msg?: string } | undefined =>
+    (e as { response?: { data?: { code?: number; msg?: string } } })?.response?.data;
+
+  // 1) 定义级订阅：让应用能收到这些审批定义下实例的状态变更事件（幂等，重复订阅返回 1390007）。
+  for (const code of codes) {
+    try {
+      const r = await client.approval.v4.approval.subscribe({ path: { approval_code: code } });
+      if (typeof r.code === 'number' && r.code !== 0) {
+        if (r.code === 1390007) logger.info(`审批定义 ${code} 已处于订阅状态`);
+        else logger.warn(`订阅审批定义 ${code} 返回异常 code=${r.code} msg=${r.msg}`);
+      } else {
+        logger.info(`已订阅审批定义 ${code}`);
       }
+    } catch (e) {
+      const body = errBody(e);
+      if (body?.code === 1390007) logger.info(`审批定义 ${code} 已处于订阅状态`);
+      else logger.warn(`订阅审批定义 ${code} 失败：${body?.msg || (e as Error).message}`);
     }
+  }
 
-    // 扫描外部审批需要 INVOLVED_APPROVAL（含他人直接发起的实例）；仅自动核销时用 MANAGED_APPROVAL。
-    const scopeType = scanEnabled ? cfg.invoiceScan.scopeType : 'MANAGED_APPROVAL';
-    const scopeResponse = await client.approval.v4.instance.subscription({
-      data: { subscription_type: scopeType },
-    });
-    if (typeof scopeResponse.code === 'number' && scopeResponse.code !== 0) {
-      throw new Error(`订阅实例范围失败 code=${scopeResponse.code} msg=${scopeResponse.msg}`);
+  // 2) 实例事件范围（INVOLVED_APPROVAL/MANAGED_APPROVAL）。
+  //    注意：该接口需 user_access_token，应用的 tenant token 会被拒（99991663），故仅尽力尝试、失败不阻断。
+  //    该范围为应用级、一次设置长期生效，通常由管理员用「用户身份」在 API Explorer 调用一次即可。
+  const scopeType = scanEnabled ? cfg.invoiceScan.scopeType : 'MANAGED_APPROVAL';
+  try {
+    const r = await client.approval.v4.instance.subscription({ data: { subscription_type: scopeType } });
+    if (typeof r.code === 'number' && r.code !== 0) {
+      logger.info(`设置实例事件范围返回 code=${r.code} msg=${r.msg}（期望 ${scopeType}）`);
+    } else {
+      logger.info(`已设置审批实例事件范围为 ${scopeType}`);
     }
-    logger.info(`已启用审批状态订阅（scope=${scopeType}，定义=${[...codes].join(',')}）`);
-  } catch (error) {
-    logger.warn(
-      '无法启用审批状态订阅，聊天内提交/查重仍可用，但审批通过后无法自动核销、外部审批发票也不会自动入台账：',
-      (error as Error).message
+  } catch (e) {
+    const body = errBody(e);
+    logger.info(
+      `未能以应用身份设置实例事件范围（code=${body?.code ?? (e as Error).message}）；` +
+        `该接口需用户身份，请由管理员在 API Explorer 用「用户身份」将范围设为 ${scopeType}（一次生效、长期有效）。`
     );
   }
+  logger.info(`审批状态订阅初始化完成（定义=${[...codes].join(',')}，期望范围=${scopeType}）`);
 }
