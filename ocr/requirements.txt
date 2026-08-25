@@ -8,6 +8,6 @@
 paddlepaddle>=2.6,<3
 paddleocr>=2.9,<3
 numpy<2
-opencv-python-headless>=4.9
+opencv-python-headless>=5.0.0.93
 fastapi>=0.141.1
 uvicorn[standard]>=0.52.4
