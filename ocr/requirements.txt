@@ -7,7 +7,7 @@
 # ocr_service.py 已尽量兼容，但请在机器上实测。
 paddlepaddle>=2.6,<3
 paddleocr>=2.9,<3
-numpy<2
+numpy<3
 opencv-python-headless>=4.9
 fastapi>=0.141.1
 uvicorn[standard]>=0.52.4
