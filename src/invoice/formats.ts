@@ -32,7 +32,28 @@ export function isZip(buf: Buffer): boolean {
   );
 }
 
-/** 是否为 OFD：ZIP 容器且包含入口 OFD.xml。 */
+/**
+ * 从 ZIP 归档中提取可识别的票据文件（pdf/ofd/常见图片）。用于用户把多张发票打包成 zip 的情况。
+ * 非递归；返回每个条目的名称与字节。失败或无可识别项返回空数组。
+ */
+export async function extractArchiveFiles(buf: Buffer): Promise<{ name: string; data: Buffer }[]> {
+  try {
+    const JSZip = (await import('jszip')).default;
+    const zip = await JSZip.loadAsync(buf);
+    const out: { name: string; data: Buffer }[] = [];
+    for (const name of Object.keys(zip.files)) {
+      const f = zip.files[name];
+      if (f.dir) continue;
+      if (!/\.(pdf|ofd|jpe?g|png|webp|bmp|gif|heic|heif)$/i.test(name)) continue;
+      out.push({ name, data: Buffer.from(await f.async('nodebuffer')) });
+    }
+    return out;
+  } catch (e) {
+    logger.warn('解压归档失败：', (e as Error).message);
+    return [];
+  }
+}
+
 export async function isOfd(buf: Buffer): Promise<boolean> {
   if (!isZip(buf)) return false;
   try {

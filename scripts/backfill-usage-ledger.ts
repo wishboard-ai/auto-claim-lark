@@ -18,7 +18,7 @@ import * as path from 'path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { loadConfig, AppConfig } from '../src/config';
 import { createClient } from '../src/lark';
-import { recognizeFile } from '../src/invoice/recognize';
+import { recognizeFileMulti } from '../src/invoice/recognize';
 import { invoiceFingerprint, describeInvoice } from '../src/invoice/dedup';
 import { fetchWithTimeout } from '../src/util/http';
 import { RecognizedInvoice } from '../src/types';
@@ -83,10 +83,6 @@ async function download(url: string, cfg: AppConfig): Promise<Buffer> {
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
-}
-
-async function recognizeBuffer(cfg: AppConfig, buf: Buffer): Promise<RecognizedInvoice> {
-  return recognizeFile(cfg, buf);
 }
 
 async function listInstances(
@@ -213,31 +209,33 @@ async function main(): Promise<void> {
       for (const url of urls) {
         try {
           const buf = await download(url, cfg);
-          const inv = await recognizeBuffer(cfg, buf);
-          if (inv.type === 'unknown') {
-            report.nonInvoice++;
-            console.log(`    [跳过·非发票/未知] ${code}（如支付截图等，不入台账）`);
-            continue;
+          const invs = await recognizeFileMulti(cfg, buf);
+          for (const inv of invs) {
+            if (inv.type === 'unknown') {
+              report.nonInvoice++;
+              console.log(`    [跳过·非发票/未知] ${code}（如支付截图/无法识别，不入台账）`);
+              continue;
+            }
+            const fp = invoiceFingerprint(inv);
+            if (existing.has(fp)) {
+              report.dupSkip++;
+              continue;
+            }
+            existing.add(fp);
+            ledger.entries.push({
+              fingerprint: fp,
+              description: describeInvoice(inv),
+              status: 'submitted',
+              reservationId: `backfill:${code}`,
+              mode: t.mode,
+              applicantOpenId: openId,
+              createdAt,
+              approvalInstanceCode: code,
+              submittedAt,
+            });
+            addedCount++;
+            console.log(`    [新增] ${describeInvoice(inv)}  fp=${fp.slice(0, 48)}`);
           }
-          const fp = invoiceFingerprint(inv);
-          if (existing.has(fp)) {
-            report.dupSkip++;
-            continue;
-          }
-          existing.add(fp);
-          ledger.entries.push({
-            fingerprint: fp,
-            description: describeInvoice(inv),
-            status: 'submitted',
-            reservationId: `backfill:${code}`,
-            mode: t.mode,
-            applicantOpenId: openId,
-            createdAt,
-            approvalInstanceCode: code,
-            submittedAt,
-          });
-          addedCount++;
-          console.log(`    [新增] ${describeInvoice(inv)}  fp=${fp.slice(0, 48)}`);
         } catch (e) {
           report.recogFail++;
           console.log(`    [失败] ${code}: ${(e as Error).message}`);

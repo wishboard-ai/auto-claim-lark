@@ -3,7 +3,7 @@ import { InvoiceType, RecognizedInvoice } from '../types';
 import { logger } from '../logger';
 import { fetchWithTimeout } from '../util/http';
 import { isPdf, extractPdfText, hasUsableText, pdfFirstPageToImage } from './pdf';
-import { isHeic, heicToJpeg, isOfd, extractOfdText } from './formats';
+import { isHeic, heicToJpeg, isOfd, extractOfdText, isZip, extractArchiveFiles } from './formats';
 
 /** OCR 前预处理图片：HEIC/HEIF 转 JPEG（视觉模型/本地OCR无法直接读取）。其余原样返回。 */
 async function prepOcrImage(buf: Buffer): Promise<Buffer> {
@@ -531,4 +531,21 @@ export async function recognizeFile(cfg: AppConfig, buf: Buffer): Promise<Recogn
     return { type: 'unknown', typeLabel: '未知票据', raw: {} };
   }
   return recognizeInvoice(cfg, buf);
+}
+
+/**
+ * 识别单个文件或“打包多发票”的归档，返回 0..N 张发票：
+ * - ZIP 归档（非 OFD）：解压其中的 pdf/ofd/图片逐个识别，返回多张；
+ * - 其它（PDF/OFD/图片）：返回单张。
+ */
+export async function recognizeFileMulti(cfg: AppConfig, buf: Buffer): Promise<RecognizedInvoice[]> {
+  if (isZip(buf) && !(await isOfd(buf))) {
+    const files = await extractArchiveFiles(buf);
+    if (files.length === 0) return [await recognizeFile(cfg, buf)];
+    logger.info(`检测到压缩包，含 ${files.length} 个可识别文件，逐个识别…`);
+    const results: RecognizedInvoice[] = [];
+    for (const f of files) results.push(await recognizeFile(cfg, f.data));
+    return results;
+  }
+  return [await recognizeFile(cfg, buf)];
 }

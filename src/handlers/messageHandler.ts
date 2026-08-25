@@ -4,7 +4,7 @@ import { logger } from '../logger';
 import { RecognizedInvoice } from '../types';
 import { downloadImage, downloadFile } from '../invoice/download';
 import { pdfFirstPageToImage, extractPdfText, hasUsableText, isPdf } from '../invoice/pdf';
-import { isOfd, isHeic, heicToJpeg } from '../invoice/formats';
+import { isOfd, isHeic, heicToJpeg, isZip, extractArchiveFiles } from '../invoice/formats';
 import { recognizeInvoice, recognizeInvoiceFromText, recognizeFile, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
 import { buildApprovalForm, FormOverrides, getCategoryOptionNames } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
@@ -272,21 +272,38 @@ export function makeMessageHandler(
     const fileBuf = await downloadFile(client, messageId, meta.file_key);
     logger.info(`文件已下载：${fileBuf.length} 字节`);
 
-    // 判定文件类型（内容魔数优先，文件名兜底）
+    // ZIP 打包多张发票（非 OFD）→ 解压后逐个处理
+    if (isZip(fileBuf) && !/\.ofd$/i.test(fileName) && !(await isOfd(fileBuf))) {
+      const files = await extractArchiveFiles(fileBuf);
+      if (files.length === 0) {
+        await sendText(chatId, '压缩包中未找到可识别的发票文件（支持 PDF / 图片 / OFD）。');
+        return;
+      }
+      logger.info(`压缩包含 ${files.length} 个可识别文件，逐个处理…`);
+      for (const f of files) await processFileBuffer(chatId, openId, f.data, f.name);
+      return;
+    }
+    await processFileBuffer(chatId, openId, fileBuf, fileName);
+  }
+
+  /** 处理单个文件字节：判类型 → 识别 → 按 PDF/OFD(附件) 或 图片/HEIC(图片控件) 落地。 */
+  async function processFileBuffer(
+    chatId: string,
+    openId: string | undefined,
+    fileBuf: Buffer,
+    fileName: string
+  ): Promise<void> {
     const asPdf = isPdf(fileBuf) || /\.pdf$/i.test(fileName);
     const asOfd = !asPdf && (/\.ofd$/i.test(fileName) || (await isOfd(fileBuf)));
     const asHeic = !asPdf && !asOfd && (isHeic(fileBuf) || /\.hei[cf]$/i.test(fileName));
     const asImage = asHeic || looksLikeImage(fileBuf) || /\.(jpe?g|png|webp|bmp|gif)$/i.test(fileName);
-
     if (!asPdf && !asOfd && !asImage) {
       await sendText(chatId, '暂不支持该文件类型。请发送发票图片（JPG/PNG/HEIC）、PDF 或 OFD 电子发票。');
       return;
     }
-
     // 统一识别（recognizeFile 内部处理 PDF 文字层/栅格化、OFD 文字层、HEIC 转 JPEG）
     const invoice = await recognizeGuarded(chatId, () => recognizeFile(cfg, fileBuf));
     if (!invoice) return;
-
     if (asPdf || asOfd) {
       // 原始文件（PDF/OFD）以「附件」形式进入审批（不进图片控件）
       const ext = asPdf ? 'pdf' : 'ofd';
