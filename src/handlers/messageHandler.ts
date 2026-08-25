@@ -4,7 +4,8 @@ import { logger } from '../logger';
 import { RecognizedInvoice } from '../types';
 import { downloadImage, downloadFile } from '../invoice/download';
 import { pdfFirstPageToImage, extractPdfText, hasUsableText, isPdf } from '../invoice/pdf';
-import { recognizeInvoice, recognizeInvoiceFromText, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
+import { isOfd, isHeic, heicToJpeg } from '../invoice/formats';
+import { recognizeInvoice, recognizeInvoiceFromText, recognizeFile, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
 import { buildApprovalForm, FormOverrides, getCategoryOptionNames } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
 import { addItem, getPending, clearPending, setDraft, setLoanSelection, selectLoan, startSession, CartItem, Draft, ClaimMode } from './session';
@@ -233,6 +234,18 @@ export function makeMessageHandler(
     return 'jpg';
   }
 
+  /** 按魔数判断常见位图（jpg/png/webp/gif/bmp）。HEIC 另由 isHeic 判断。 */
+  function looksLikeImage(buf: Buffer): boolean {
+    if (buf.length < 4) return false;
+    return (
+      (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) || // jpg
+      (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) || // png
+      buf.toString('ascii', 0, 4) === 'RIFF' || // webp
+      (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) || // gif
+      (buf[0] === 0x42 && buf[1] === 0x4d) // bmp
+    );
+  }
+
   async function handleImage(
     chatId: string,
     openId: string | undefined,
@@ -255,43 +268,42 @@ export function makeMessageHandler(
     const meta = JSON.parse(content) as { file_key?: string; file_name?: string };
     const fileName = meta.file_name || '';
     if (!meta.file_key) return;
-    const isPdfName = /\.pdf$/i.test(fileName);
     logger.info(`收到文件消息（messageId=${messageId}, name=${fileName}），开始下载…`);
     const fileBuf = await downloadFile(client, messageId, meta.file_key);
     logger.info(`文件已下载：${fileBuf.length} 字节`);
 
-    if (!isPdfName && !isPdf(fileBuf)) {
-      await sendText(chatId, '暂不支持该文件类型。请发送发票图片，或 PDF 格式的电子发票。');
+    // 判定文件类型（内容魔数优先，文件名兜底）
+    const asPdf = isPdf(fileBuf) || /\.pdf$/i.test(fileName);
+    const asOfd = !asPdf && (/\.ofd$/i.test(fileName) || (await isOfd(fileBuf)));
+    const asHeic = !asPdf && !asOfd && (isHeic(fileBuf) || /\.hei[cf]$/i.test(fileName));
+    const asImage = asHeic || looksLikeImage(fileBuf) || /\.(jpe?g|png|webp|bmp|gif)$/i.test(fileName);
+
+    if (!asPdf && !asOfd && !asImage) {
+      await sendText(chatId, '暂不支持该文件类型。请发送发票图片（JPG/PNG/HEIC）、PDF 或 OFD 电子发票。');
       return;
     }
 
-    // 优先读取 PDF 文字层：文本型 PDF 直接按文本识别（更快/更省/更准，无需栅格化）。
-    // 注意：原始 PDF 作为「附件」提交；栅格化仅在无文字层时用于识别、不作为提交内容。
-    const pdfText = await extractPdfText(fileBuf);
-    let invoice: RecognizedInvoice | null;
-
-    if (hasUsableText(pdfText)) {
-      logger.info(`PDF 含文字层（${pdfText.replace(/\s+/g, '').length} 字），按文本识别…`);
-      invoice = await recognizeGuarded(chatId, () => recognizeInvoiceFromText(cfg, pdfText));
-    } else {
-      // 无文字层（扫描件/图片型 PDF）→ 栅格化首页仅用于视觉识别（不上传）。
-      logger.info('PDF 无可用文字层，栅格化首页后走视觉识别…');
-      let imageBuf: Buffer;
-      try {
-        imageBuf = await pdfFirstPageToImage(fileBuf);
-        logger.info(`PDF 已转为图片用于识别：${imageBuf.length} 字节`);
-      } catch (e) {
-        logger.error('PDF 转图片失败', e);
-        await sendText(chatId, `PDF 解析失败：${(e as Error).message}\n可尝试改发发票截图/图片。`);
-        return;
-      }
-      invoice = await recognizeGuarded(chatId, () => recognizeInvoice(cfg, imageBuf));
-    }
+    // 统一识别（recognizeFile 内部处理 PDF 文字层/栅格化、OFD 文字层、HEIC 转 JPEG）
+    const invoice = await recognizeGuarded(chatId, () => recognizeFile(cfg, fileBuf));
     if (!invoice) return;
 
-    // 原始 PDF 以「附件」形式进入审批（不进图片控件）。
-    const attachName = /\.pdf$/i.test(fileName) ? fileName : 'invoice.pdf';
-    await finalizeInvoice(chatId, openId, invoice, { fileBuffer: fileBuf, fileName: attachName });
+    if (asPdf || asOfd) {
+      // 原始文件（PDF/OFD）以「附件」形式进入审批（不进图片控件）
+      const ext = asPdf ? 'pdf' : 'ofd';
+      const attachName = new RegExp(`\\.${ext}$`, 'i').test(fileName) ? fileName : `invoice.${ext}`;
+      await finalizeInvoice(chatId, openId, invoice, { fileBuffer: fileBuf, fileName: attachName });
+    } else {
+      // 图片（含 HEIC）→「图片」控件；HEIC 转 JPEG 以便审批中正常显示
+      let imgBuf = fileBuf;
+      if (asHeic) {
+        const jpeg = await heicToJpeg(fileBuf).catch((e) => {
+          logger.warn('HEIC 转 JPEG（附图用）失败：', (e as Error).message);
+          return null;
+        });
+        if (jpeg) imgBuf = jpeg;
+      }
+      await finalizeInvoice(chatId, openId, invoice, { imageBuffer: imgBuf });
+    }
   }
 
   /** 识别一张发票图片并按模式加入报销单 / 直接创建（图片消息用）。 */

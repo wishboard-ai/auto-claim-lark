@@ -2,6 +2,22 @@ import { AppConfig } from '../config';
 import { InvoiceType, RecognizedInvoice } from '../types';
 import { logger } from '../logger';
 import { fetchWithTimeout } from '../util/http';
+import { isPdf, extractPdfText, hasUsableText, pdfFirstPageToImage } from './pdf';
+import { isHeic, heicToJpeg, isOfd, extractOfdText } from './formats';
+
+/** OCR 前预处理图片：HEIC/HEIF 转 JPEG（视觉模型/本地OCR无法直接读取）。其余原样返回。 */
+async function prepOcrImage(buf: Buffer): Promise<Buffer> {
+  if (isHeic(buf)) {
+    logger.info('检测到 HEIC/HEIF 图片，转换为 JPEG 后识别…');
+    try {
+      return await heicToJpeg(buf);
+    } catch (e) {
+      logger.warn('HEIC 转换失败，尝试按原样识别：', (e as Error).message);
+      return buf;
+    }
+  }
+  return buf;
+}
 
 /**
  * 发票识别。支持两种后端（OCR_PROVIDER）：
@@ -316,8 +332,9 @@ async function pullOllamaModel(baseUrl: string, model: string): Promise<void> {
 
 async function recognizeViaOpenAI(cfg: AppConfig, file: Buffer): Promise<RecognizedInvoice> {
   const { ocr } = cfg;
-  const dataUri = `data:${mimeForImage(file)};base64,${file.toString('base64')}`;
-  logger.info(`调用 OCR 识别（provider=openai, model=${ocr.model}, 图片 ${file.length} 字节）…`);
+  const img = await prepOcrImage(file);
+  const dataUri = `data:${mimeForImage(img)};base64,${img.toString('base64')}`;
+  logger.info(`调用 OCR 识别（provider=openai, model=${ocr.model}, 图片 ${img.length} 字节）…`);
   return openAIChatToInvoice(cfg, [
     { type: 'image_url', image_url: { url: dataUri } },
     { type: 'text', text: EXTRACT_PROMPT },
@@ -403,7 +420,8 @@ async function openAIChatToInvoice(cfg: AppConfig, content: unknown): Promise<Re
 async function recognizeViaPaddle(cfg: AppConfig, file: Buffer): Promise<RecognizedInvoice> {
   const { ocr } = cfg;
   const url = `${ocr.baseUrl.replace(/\/$/, '')}/recognize`;
-  logger.info(`调用 OCR 识别（provider=paddle, ${url}, 图片 ${file.length} 字节）…`);
+  const img = await prepOcrImage(file);
+  logger.info(`调用 OCR 识别（provider=paddle, ${url}, 图片 ${img.length} 字节）…`);
 
   let resp: Response;
   try {
@@ -411,9 +429,9 @@ async function recognizeViaPaddle(cfg: AppConfig, file: Buffer): Promise<Recogni
       url,
       {
         method: 'POST',
-        headers: { 'Content-Type': mimeForImage(file) },
+        headers: { 'Content-Type': mimeForImage(img) },
         // Node 原生 fetch 接受 Uint8Array 作为 body；用 any 规避 DOM BodyInit 类型缺失
-        body: new Uint8Array(file) as any,
+        body: new Uint8Array(img) as any,
       },
       cfg.requestTimeoutMs
     );
@@ -492,4 +510,25 @@ export async function recognizeInvoiceFromText(cfg: AppConfig, text: string): Pr
   if (!ocr.enabled) throw new OcrNotConfiguredError();
   if (ocr.provider === 'paddle') return recognizeTextViaPaddle(cfg, text);
   return recognizeTextViaOpenAI(cfg, text);
+}
+
+/**
+ * 统一识别任意受支持的票据文件（供文件消息与历史回填共用）：
+ * - PDF：优先文字层，无文字层则栅格化首页走视觉识别；
+ * - OFD（电子发票 ZIP 容器）：解压抽取文字层走文本识别；
+ * - 图片（含 HEIC/HEIF）：直接视觉识别（HEIC 会先转 JPEG）。
+ */
+export async function recognizeFile(cfg: AppConfig, buf: Buffer): Promise<RecognizedInvoice> {
+  if (isPdf(buf)) {
+    const text = await extractPdfText(buf);
+    if (hasUsableText(text)) return recognizeInvoiceFromText(cfg, text);
+    return recognizeInvoice(cfg, await pdfFirstPageToImage(buf));
+  }
+  if (await isOfd(buf)) {
+    const text = await extractOfdText(buf);
+    if (hasUsableText(text)) return recognizeInvoiceFromText(cfg, text);
+    logger.warn('OFD 无可用文字层，无法识别');
+    return { type: 'unknown', typeLabel: '未知票据', raw: {} };
+  }
+  return recognizeInvoice(cfg, buf);
 }

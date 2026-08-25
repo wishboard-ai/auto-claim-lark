@@ -18,8 +18,7 @@ import * as path from 'path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { loadConfig, AppConfig } from '../src/config';
 import { createClient } from '../src/lark';
-import { recognizeInvoice, recognizeInvoiceFromText } from '../src/invoice/recognize';
-import { isPdf, extractPdfText, hasUsableText, pdfFirstPageToImage } from '../src/invoice/pdf';
+import { recognizeFile } from '../src/invoice/recognize';
 import { invoiceFingerprint, describeInvoice } from '../src/invoice/dedup';
 import { fetchWithTimeout } from '../src/util/http';
 import { RecognizedInvoice } from '../src/types';
@@ -87,13 +86,7 @@ async function download(url: string, cfg: AppConfig): Promise<Buffer> {
 }
 
 async function recognizeBuffer(cfg: AppConfig, buf: Buffer): Promise<RecognizedInvoice> {
-  if (isPdf(buf)) {
-    const text = await extractPdfText(buf);
-    if (hasUsableText(text)) return recognizeInvoiceFromText(cfg, text);
-    const img = await pdfFirstPageToImage(buf);
-    return recognizeInvoice(cfg, img);
-  }
-  return recognizeInvoice(cfg, buf);
+  return recognizeFile(cfg, buf);
 }
 
 async function listInstances(

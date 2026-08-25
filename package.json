@@ -25,6 +25,8 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.72.0",
     "dotenv": "^17.4.2",
+    "heic-convert": "^2.1.0",
+    "jszip": "^3.10.1",
     "pdf-to-img": "^6.2.0"
   },
   "overrides": {
