@@ -6,7 +6,7 @@
 # 为稳妥默认锁在 2.9.x（与规则抽取匹配、经充分验证的一线）。如需升到 3.x，改 <3 上限即可，
 # ocr_service.py 已尽量兼容，但请在机器上实测。
 paddlepaddle>=2.6,<3
-paddleocr>=2.9,<3
+paddleocr>=3.7.0,<4
 numpy<2
 opencv-python-headless>=4.9
 fastapi>=0.141.1
