@@ -45,12 +45,18 @@ export function makeApprovalStatusHandler(
     scanning.add(instanceCode);
     try {
       const result = await scanInstanceInvoices(client, cfg, invoiceUsageLedger, instanceCode, mode);
-      if (result.added > 0) {
+      if (result.skipped) {
+        logger.info(`外部审批实例已在台账，跳过（instance=${instanceCode}）`);
+      } else if (result.added > 0) {
         logger.info(
           `外部审批发票已入检重台账（instance=${instanceCode}, mode=${mode}, 新增=${result.added}/${result.scanned}）`
         );
-      } else if (!result.skipped && result.hasFiles && result.scanned > 0) {
-        logger.info(`外部审批发票均已在台账或无法识别（instance=${instanceCode}）`);
+      } else if (!result.hasFiles) {
+        logger.info(`外部审批无图片/附件控件，无发票可入账（instance=${instanceCode}）`);
+      } else {
+        logger.info(
+          `外部审批发票均已在台账或无法识别（instance=${instanceCode}, 识别=${result.scanned}）`
+        );
       }
     } catch (e) {
       logger.warn(`外部审批发票扫描失败（instance=${instanceCode}）：`, (e as Error).message);
