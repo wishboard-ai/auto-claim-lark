@@ -127,7 +127,8 @@ export function previewCard(
   reason: string | undefined,
   categoryNames: string[] = [],
   loan: LoanReference | undefined,
-  mode: ClaimMode
+  mode: ClaimMode,
+  attachmentCount = 0
 ): string {
   const list = invoices.map((v, i) => briefLine(v, i + 1)).join('\n');
   const rows = [`**${title}**`];
@@ -143,6 +144,7 @@ export function previewCard(
     }
   }
   rows.push(`共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}`);
+  if (attachmentCount > 0) rows.push(`**附加材料**：${attachmentCount} 个（仅附件，不计入金额）`);
   rows.push('');
   rows.push(list);
   const hint =

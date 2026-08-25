@@ -17,9 +17,21 @@ export interface CartItem {
 }
 export type ClaimMode = 'loan_writeoff' | 'expense';
 
+/** 辅助材料附件（支付截图/行程单等）：不识别、不查重，仅随审批一起提交。 */
+export interface Attachment {
+  imageBuffer?: Buffer;
+  imageExt?: string;
+  fileBuffer?: Buffer;
+  fileName?: string;
+}
+
 /** 一次待提交的报销（可含多张发票） */
 export interface PendingClaim {
   items: CartItem[];
+  /** 辅助材料（支付截图/行程单等，仅附件、不识别） */
+  attachments: Attachment[];
+  /** 是否处于「附件模式」：此时收到的图片/文件作为材料附件而非发票 */
+  collectingAttachments?: boolean;
   createdAt: number;
   mode: ClaimMode;
   /** 进入「提交前预览/待确认」阶段后填充；用户回复「确认」时据此创建审批。 */
@@ -57,15 +69,33 @@ export function addItem(openId: string, item: CartItem): PendingClaim {
     return existing;
   }
   // 正常流程会先选择模式；兜底按费用报销，避免旧调用方产生无效会话。
-  const claim: PendingClaim = { items: [item], createdAt: Date.now(), mode: 'expense' };
+  const claim: PendingClaim = { items: [item], attachments: [], createdAt: Date.now(), mode: 'expense' };
   store.set(openId, claim);
   return claim;
 }
 
 export function startSession(openId: string, mode: ClaimMode): PendingClaim {
-  const claim: PendingClaim = { items: [], createdAt: Date.now(), mode };
+  const claim: PendingClaim = { items: [], attachments: [], createdAt: Date.now(), mode };
   store.set(openId, claim);
   return claim;
+}
+
+/** 追加一个辅助材料附件（不识别）。作废旧预览。会话不存在返回 undefined。 */
+export function addAttachment(openId: string, att: Attachment): PendingClaim | undefined {
+  const c = getPending(openId);
+  if (!c) return undefined;
+  c.attachments.push(att);
+  c.draft = undefined;
+  c.createdAt = Date.now();
+  return c;
+}
+
+/** 开关「附件模式」。 */
+export function setCollecting(openId: string, on: boolean): void {
+  const c = getPending(openId);
+  if (!c) return;
+  c.collectingAttachments = on;
+  c.createdAt = Date.now();
 }
 
 export function setLoanSelection(openId: string, candidates: LoanReference[], reason: string): void {

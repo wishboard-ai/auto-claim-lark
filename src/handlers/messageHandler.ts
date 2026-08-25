@@ -8,7 +8,7 @@ import { isOfd, isHeic, heicToJpeg, isZip, extractArchiveFiles } from '../invoic
 import { recognizeInvoice, recognizeInvoiceFromText, recognizeFile, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
 import { buildApprovalForm, FormOverrides, getCategoryOptionNames } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
-import { addItem, getPending, clearPending, setDraft, setLoanSelection, selectLoan, startSession, CartItem, Draft, ClaimMode } from './session';
+import { addItem, getPending, clearPending, setDraft, setLoanSelection, selectLoan, startSession, addAttachment, setCollecting, CartItem, Draft, ClaimMode, Attachment } from './session';
 import { addedCard, successCard, previewCard, loanSelectionCard, modeSelectionCard } from '../reply/cards';
 import { generateContent } from '../llm';
 import { uploadApprovalFile } from '../approval/uploadImage';
@@ -18,6 +18,9 @@ import { InvoiceDuplicateError, InvoiceUsageLedger, invoiceFingerprint } from '.
 
 const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '好'];
 const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
+// 附件模式开/关关键词
+const ATTACH_ON_WORDS = ['附件', '补充材料', '辅助材料', '材料', '附材料', '加附件', '上传附件'];
+const ATTACH_OFF_WORDS = ['发票', '继续发票', '继续发发票', '发发票'];
 
 const HELP_TEXT =
   '你好，我是费用助手 🧾\n请先选择办理类型：回复「借款核销」或「费用报销」。';
@@ -94,12 +97,12 @@ export function makeMessageHandler(
   }
 
   /** 展示「提交前预览/确认」卡片（不创建审批）。 */
-  async function showPreview(chatId: string, items: CartItem[], draft: Draft, mode: ClaimMode, loan?: LoanReference): Promise<void> {
+  async function showPreview(chatId: string, items: CartItem[], draft: Draft, mode: ClaimMode, loan?: LoanReference, attachmentCount = 0): Promise<void> {
     const invoices = items.map((i) => i.invoice);
     const built = buildApprovalForm(invoices, draftToOverrides(draft), [], [], loan);
     const title = mode === 'expense' ? built.title.replace(/^借款核销/, '费用报销') : built.title;
     const categoryLabel = built.categoryLabel;
-    await sendCard(chatId, previewCard(invoices, title, categoryLabel, draft.reason, getCategoryOptionNames(mode), loan, mode));
+    await sendCard(chatId, previewCard(invoices, title, categoryLabel, draft.reason, getCategoryOptionNames(mode), loan, mode, attachmentCount));
   }
 
   /** 用草稿实际创建审批：上传图片 → 构建表单 → 创建 → 回复结果卡片。 */
@@ -109,7 +112,8 @@ export function makeMessageHandler(
     items: CartItem[],
     draft: Draft,
     loan: LoanReference | undefined,
-    mode: ClaimMode
+    mode: ClaimMode,
+    attachments: Attachment[] = []
   ): Promise<boolean> {
     const invoices = items.map((i) => i.invoice);
     const claimAmount = invoices.reduce((sum, invoice) => sum + (Number(invoice.amount) || 0), 0);
@@ -132,6 +136,17 @@ export function makeMessageHandler(
         }
         if (it.fileBuffer) {
           const code = await uploadApprovalFile(cfg, it.fileBuffer, it.fileName || 'invoice.pdf', 'attachment');
+          if (code) attachmentCodes.push(code);
+        }
+      }
+      // 辅助材料（支付截图/行程单等）：图片→图片控件，文件→附件控件；不识别、不查重
+      for (const a of attachments) {
+        if (a.imageBuffer) {
+          const code = await uploadApprovalFile(cfg, a.imageBuffer, `material.${a.imageExt || 'jpg'}`, 'image');
+          if (code) imageCodes.push(code);
+        }
+        if (a.fileBuffer) {
+          const code = await uploadApprovalFile(cfg, a.fileBuffer, a.fileName || 'material', 'attachment');
           if (code) attachmentCodes.push(code);
         }
       }
@@ -256,6 +271,11 @@ export function makeMessageHandler(
     logger.info(`收到图片消息（messageId=${messageId}），开始下载…`);
     const buffer = await downloadImage(client, messageId, imageKey);
     logger.info(`图片已下载：${buffer.length} 字节`);
+    if (openId && getPending(openId)?.collectingAttachments) {
+      const c = addAttachment(openId, { imageBuffer: buffer, imageExt: imgExt(buffer) });
+      await sendText(chatId, `已附加材料（图片），当前材料 ${c?.attachments.length ?? 1} 个。继续发材料，或回复「发票」继续发发票，或回复事由提交。`);
+      return;
+    }
     await recognizeAndCollect(chatId, openId, buffer);
   }
 
@@ -271,6 +291,29 @@ export function makeMessageHandler(
     logger.info(`收到文件消息（messageId=${messageId}, name=${fileName}），开始下载…`);
     const fileBuf = await downloadFile(client, messageId, meta.file_key);
     logger.info(`文件已下载：${fileBuf.length} 字节`);
+
+    // 附件模式：整份文件作为辅助材料附上，不识别、不解压
+    if (openId && getPending(openId)?.collectingAttachments) {
+      const isImg =
+        isHeic(fileBuf) || looksLikeImage(fileBuf) || /\.(jpe?g|png|webp|bmp|gif|hei[cf])$/i.test(fileName);
+      let att: Attachment;
+      if (isImg) {
+        let imgBuf = fileBuf;
+        if (isHeic(fileBuf) || /\.hei[cf]$/i.test(fileName)) {
+          const jpeg = await heicToJpeg(fileBuf).catch(() => null);
+          if (jpeg) imgBuf = jpeg;
+        }
+        att = { imageBuffer: imgBuf, imageExt: imgExt(imgBuf) };
+      } else {
+        att = { fileBuffer: fileBuf, fileName: fileName || 'material' };
+      }
+      const c = addAttachment(openId, att);
+      await sendText(
+        chatId,
+        `已附加材料（${isImg ? '图片' : '文件'}${fileName ? '：' + fileName : ''}），当前材料 ${c?.attachments.length ?? 1} 个。继续发材料，或回复「发票」继续发发票，或回复事由提交。`
+      );
+      return;
+    }
 
     // ZIP 打包多张发票（非 OFD）→ 解压后逐个处理
     if (isZip(fileBuf) && !/\.ofd$/i.test(fileName) && !(await isOfd(fileBuf))) {
@@ -433,15 +476,26 @@ export function makeMessageHandler(
         return;
       }
       pending = startSession(openId, chosenMode);
-      await sendText(chatId, chosenMode === 'loan_writeoff' ? '已选择「借款核销」。请发送本次实际消费的发票，发送完成后回复核销事由。' : '已选择「费用报销」。请发送报销发票，发送完成后回复报销事由。');
+      await sendText(chatId, chosenMode === 'loan_writeoff' ? '已选择「借款核销」。请发送本次实际消费的发票，发送完成后回复核销事由。（如需附支付截图/行程单等材料，回复「附件」）' : '已选择「费用报销」。请发送报销发票，发送完成后回复报销事由。（如需附支付截图/行程单等材料，回复「附件」）');
       return;
     }
     if (!openId || !pending) {
       await sendCard(chatId, modeSelectionCard());
       return;
     }
+    // 附件模式开关（支付截图/行程单等只附加、不识别/查重）
+    if (ATTACH_ON_WORDS.includes(raw)) {
+      setCollecting(openId, true);
+      await sendText(chatId, '已进入附件模式：请发送支付截图、行程单等辅助材料（图片或文件），只作为附件、不做识别/查重。发完回复「发票」继续发发票，或直接回复事由提交。');
+      return;
+    }
+    if (ATTACH_OFF_WORDS.includes(raw) && pending.collectingAttachments) {
+      setCollecting(openId, false);
+      await sendText(chatId, '已切回发票模式：请继续发送发票。');
+      return;
+    }
     if (pending.items.length === 0) {
-      await sendText(chatId, `当前已选择「${pending.mode === 'loan_writeoff' ? '借款核销' : '费用报销'}」，请发送发票图片或 PDF。`);
+      await sendText(chatId, `当前已选择「${pending.mode === 'loan_writeoff' ? '借款核销' : '费用报销'}」，请发送发票图片/PDF/OFD。（如需附支付截图、行程单等材料，回复「附件」）`);
       return;
     }
 
@@ -450,7 +504,7 @@ export function makeMessageHandler(
       if (CONFIRM_WORDS.includes(lower)) {
         const items = pending.items;
         const draft = pending.draft;
-        const submitted = await submitDraft(chatId, openId, items, draft, pending.loan, pending.mode);
+        const submitted = await submitDraft(chatId, openId, items, draft, pending.loan, pending.mode, pending.attachments);
         if (submitted) clearPending(openId);
         return;
       }
@@ -458,13 +512,13 @@ export function makeMessageHandler(
       if (getCategoryOptionNames(pending.mode).includes(raw)) {
         const draft: Draft = { ...pending.draft, category: raw };
         setDraft(openId, draft);
-        await showPreview(chatId, pending.items, draft, pending.mode, pending.loan);
+        await showPreview(chatId, pending.items, draft, pending.mode, pending.loan, pending.attachments.length);
         return;
       }
       // 其他文字 → 作为新的核销事由，重新整理并再次预览
       const draft = await buildDraft(pending.items, raw, pending.mode);
       setDraft(openId, draft);
-      await showPreview(chatId, pending.items, draft, pending.mode, pending.loan);
+      await showPreview(chatId, pending.items, draft, pending.mode, pending.loan, pending.attachments.length);
       return;
     }
 
@@ -486,7 +540,7 @@ export function makeMessageHandler(
       selectLoan(openId, loan);
       const draft = await buildDraft(pending.items, reason, pending.mode);
       setDraft(openId, draft);
-      await showPreview(chatId, pending.items, draft, pending.mode, loan);
+      await showPreview(chatId, pending.items, draft, pending.mode, loan, pending.attachments.length);
       return;
     }
 
@@ -511,13 +565,13 @@ export function makeMessageHandler(
       selectLoan(openId, loans[0]);
       const draft = await buildDraft(pending.items, raw, pending.mode);
       setDraft(openId, draft);
-      await showPreview(chatId, pending.items, draft, pending.mode, loans[0]);
+      await showPreview(chatId, pending.items, draft, pending.mode, loans[0], pending.attachments.length);
       return;
     }
 
     const draft = await buildDraft(pending.items, raw, pending.mode);
     setDraft(openId, draft);
-    await showPreview(chatId, pending.items, draft, pending.mode);
+    await showPreview(chatId, pending.items, draft, pending.mode, undefined, pending.attachments.length);
   }
 
   async function onChatEntered(event: any): Promise<void> {
