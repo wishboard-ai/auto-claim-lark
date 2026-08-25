@@ -9,5 +9,5 @@ paddlepaddle>=2.6,<3
 paddleocr>=2.9,<3
 numpy<2
 opencv-python-headless>=4.9
-fastapi>=0.115
+fastapi>=0.141.1
 uvicorn[standard]>=0.30
