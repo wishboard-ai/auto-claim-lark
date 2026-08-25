@@ -128,9 +128,12 @@ export function previewCard(
   categoryNames: string[] = [],
   loan: LoanReference | undefined,
   mode: ClaimMode,
-  attachmentCount = 0
+  attachmentCount = 0,
+  claimAmount?: number
 ): string {
   const list = invoices.map((v, i) => briefLine(v, i + 1)).join('\n');
+  const invoiceTotal = Number(totalAmount(invoices));
+  const claim = claimAmount != null ? claimAmount : invoiceTotal;
   const rows = [`**${title}**`];
   if (categoryLabel) rows.push(`**报销类别**：${categoryLabel}`);
   if (reason) rows.push(`**${mode === 'loan_writeoff' ? '核销' : '报销'}事由**：${reason}`);
@@ -139,17 +142,19 @@ export function previewCard(
     rows.push(`**实际借款时间**：${new Date(loan.approvedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}`);
     if (loan.amount) rows.push(`**借款金额**：¥${loan.amount}`);
     if (loan.remainingAmount) {
-      const after = Math.max(0, Number(loan.remainingAmount) - Number(totalAmount(invoices)));
+      const after = Math.max(0, Number(loan.remainingAmount) - claim);
       rows.push(`**核销前剩余**：¥${loan.remainingAmount}　**本次后剩余**：¥${after.toFixed(2)}`);
     }
   }
-  rows.push(`共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}`);
+  rows.push(`共 ${invoices.length} 张，发票合计 ¥${invoiceTotal.toFixed(2)}`);
+  rows.push(`**本次${mode === 'loan_writeoff' ? '核销' : '报销'}金额**：¥${claim.toFixed(2)}${claim < invoiceTotal ? '（少于发票合计）' : ''}`);
   if (attachmentCount > 0) rows.push(`**附加材料**：${attachmentCount} 个（仅附件，不计入金额）`);
   rows.push('');
   rows.push(list);
   const hint =
     '回复「**确认**」提交审批；回复「**取消**」放弃。\n' +
     (categoryNames.length ? `如需改类别，回复其中一个名称：${categoryNames.join(' / ')}。\n` : '') +
+    `如需只报部分金额，回复「**金额 数字**」（不超过 ¥${invoiceTotal.toFixed(2)}）。\n` +
     '如需改事由，直接回复新的事由文字，我会重新整理并再次预览。';
   return JSON.stringify({
     config: { wide_screen_mode: true },

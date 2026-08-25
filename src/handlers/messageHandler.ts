@@ -8,7 +8,7 @@ import { isOfd, isHeic, heicToJpeg, isZip, extractArchiveFiles } from '../invoic
 import { recognizeInvoice, recognizeInvoiceFromText, recognizeFile, QuotaExceededError, OcrNotConfiguredError } from '../invoice/recognize';
 import { buildApprovalForm, FormOverrides, getCategoryOptionNames } from '../approval/fieldMapping';
 import { createApprovalInstance } from '../approval/submit';
-import { addItem, getPending, clearPending, setDraft, setLoanSelection, selectLoan, startSession, addAttachment, setCollecting, CartItem, Draft, ClaimMode, Attachment } from './session';
+import { addItem, getPending, clearPending, setDraft, setLoanSelection, selectLoan, startSession, addAttachment, setCollecting, setClaimAmount, CartItem, Draft, ClaimMode, Attachment } from './session';
 import { addedCard, successCard, previewCard, loanSelectionCard, modeSelectionCard } from '../reply/cards';
 import { generateContent } from '../llm';
 import { uploadApprovalFile } from '../approval/uploadImage';
@@ -97,12 +97,12 @@ export function makeMessageHandler(
   }
 
   /** 展示「提交前预览/确认」卡片（不创建审批）。 */
-  async function showPreview(chatId: string, items: CartItem[], draft: Draft, mode: ClaimMode, loan?: LoanReference, attachmentCount = 0): Promise<void> {
+  async function showPreview(chatId: string, items: CartItem[], draft: Draft, mode: ClaimMode, loan?: LoanReference, attachmentCount = 0, claimAmount?: number): Promise<void> {
     const invoices = items.map((i) => i.invoice);
-    const built = buildApprovalForm(invoices, draftToOverrides(draft), [], [], loan);
+    const built = buildApprovalForm(invoices, draftToOverrides(draft), [], [], loan, claimAmount);
     const title = mode === 'expense' ? built.title.replace(/^借款核销/, '费用报销') : built.title;
     const categoryLabel = built.categoryLabel;
-    await sendCard(chatId, previewCard(invoices, title, categoryLabel, draft.reason, getCategoryOptionNames(mode), loan, mode, attachmentCount));
+    await sendCard(chatId, previewCard(invoices, title, categoryLabel, draft.reason, getCategoryOptionNames(mode), loan, mode, attachmentCount, claimAmount));
   }
 
   /** 用草稿实际创建审批：上传图片 → 构建表单 → 创建 → 回复结果卡片。 */
@@ -113,10 +113,13 @@ export function makeMessageHandler(
     draft: Draft,
     loan: LoanReference | undefined,
     mode: ClaimMode,
-    attachments: Attachment[] = []
+    attachments: Attachment[] = [],
+    customAmount?: number
   ): Promise<boolean> {
     const invoices = items.map((i) => i.invoice);
-    const claimAmount = invoices.reduce((sum, invoice) => sum + (Number(invoice.amount) || 0), 0);
+    const invoiceTotal = invoices.reduce((sum, invoice) => sum + (Number(invoice.amount) || 0), 0);
+    // 有效报销/核销金额：自定义(≤发票合计，已在入口校验)优先，否则默认=发票合计
+    const claimAmount = customAmount != null ? customAmount : invoiceTotal;
     if (mode === 'loan_writeoff' && cfg.writeOff.enabled && ledger) {
       if (!loan) { await sendText(chatId, '尚未选择要核销的付款申请。'); return false; }
       const remaining = ledger.remaining(loan.instanceCode, Number(loan.amount) || 0);
@@ -152,7 +155,7 @@ export function makeMessageHandler(
       }
       const reason = mode === 'loan_writeoff' && loan ? `[付款申请 ${loan.serialNumber}] ${draft.reason}` : draft.reason;
       const effectiveDraft = { ...draft, reason };
-      const built = buildApprovalForm(invoices, draftToOverrides(effectiveDraft), imageCodes, attachmentCodes, loan);
+      const built = buildApprovalForm(invoices, draftToOverrides(effectiveDraft), imageCodes, attachmentCodes, loan, claimAmount);
       const form = built.form;
       const title = mode === 'expense' ? built.title.replace(/^借款核销/, '费用报销') : built.title;
       const categoryLabel = built.categoryLabel;
@@ -504,21 +507,38 @@ export function makeMessageHandler(
       if (CONFIRM_WORDS.includes(lower)) {
         const items = pending.items;
         const draft = pending.draft;
-        const submitted = await submitDraft(chatId, openId, items, draft, pending.loan, pending.mode, pending.attachments);
+        const submitted = await submitDraft(chatId, openId, items, draft, pending.loan, pending.mode, pending.attachments, pending.claimAmount);
         if (submitted) clearPending(openId);
+        return;
+      }
+      // 设定自定义报销/核销金额：「金额 800」「报销金额 800」「核销金额 800」
+      const amountMatch = raw.match(/^(?:报销金额|核销金额|金额)\s*[:：]?\s*(\d+(?:\.\d+)?)$/);
+      if (amountMatch) {
+        const amt = Number(amountMatch[1]);
+        const invoiceTotal = pending.items.reduce((s, it) => s + (Number(it.invoice.amount) || 0), 0);
+        if (!(amt > 0)) {
+          await sendText(chatId, '金额需大于 0，请重新输入，如「金额 800」。');
+          return;
+        }
+        if (amt > invoiceTotal + 0.005) {
+          await sendText(chatId, `本次${pending.mode === 'loan_writeoff' ? '核销' : '报销'}金额不能超过发票合计 ¥${invoiceTotal.toFixed(2)}。`);
+          return;
+        }
+        setClaimAmount(openId, amt);
+        await showPreview(chatId, pending.items, pending.draft, pending.mode, pending.loan, pending.attachments.length, amt);
         return;
       }
       // 回复某个合法类别名 → 仅改类别并重新预览（无需再调用 LLM）
       if (getCategoryOptionNames(pending.mode).includes(raw)) {
         const draft: Draft = { ...pending.draft, category: raw };
         setDraft(openId, draft);
-        await showPreview(chatId, pending.items, draft, pending.mode, pending.loan, pending.attachments.length);
+        await showPreview(chatId, pending.items, draft, pending.mode, pending.loan, pending.attachments.length, pending.claimAmount);
         return;
       }
       // 其他文字 → 作为新的核销事由，重新整理并再次预览
       const draft = await buildDraft(pending.items, raw, pending.mode);
       setDraft(openId, draft);
-      await showPreview(chatId, pending.items, draft, pending.mode, pending.loan, pending.attachments.length);
+      await showPreview(chatId, pending.items, draft, pending.mode, pending.loan, pending.attachments.length, pending.claimAmount);
       return;
     }
 
@@ -540,7 +560,7 @@ export function makeMessageHandler(
       selectLoan(openId, loan);
       const draft = await buildDraft(pending.items, reason, pending.mode);
       setDraft(openId, draft);
-      await showPreview(chatId, pending.items, draft, pending.mode, loan, pending.attachments.length);
+      await showPreview(chatId, pending.items, draft, pending.mode, loan, pending.attachments.length, pending.claimAmount);
       return;
     }
 
@@ -565,13 +585,13 @@ export function makeMessageHandler(
       selectLoan(openId, loans[0]);
       const draft = await buildDraft(pending.items, raw, pending.mode);
       setDraft(openId, draft);
-      await showPreview(chatId, pending.items, draft, pending.mode, loans[0], pending.attachments.length);
+      await showPreview(chatId, pending.items, draft, pending.mode, loans[0], pending.attachments.length, pending.claimAmount);
       return;
     }
 
     const draft = await buildDraft(pending.items, raw, pending.mode);
     setDraft(openId, draft);
-    await showPreview(chatId, pending.items, draft, pending.mode, undefined, pending.attachments.length);
+    await showPreview(chatId, pending.items, draft, pending.mode, undefined, pending.attachments.length, pending.claimAmount);
   }
 
   async function onChatEntered(event: any): Promise<void> {

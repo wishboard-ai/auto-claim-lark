@@ -174,7 +174,8 @@ export function buildApprovalForm(
   overrides: FormOverrides = {},
   imageCodes: string[] = [],
   attachmentCodes: string[] = [],
-  loan?: LoanReference
+  loan?: LoanReference,
+  claimAmount?: number
 ): { form: FormField[]; title: string; categoryLabel?: string } {
   const cfg = loadMapping();
   const form: FormField[] = [];
@@ -236,9 +237,11 @@ export function buildApprovalForm(
     form.push({ id: cfg.attachmentField.widgetId, type: cfg.attachmentField.widgetType, value: attachmentCodes });
   }
 
-  // 合计金额控件：填入所有发票金额之和（条件分流依据此字段，必须填，否则默认走高限额分支）
+  // 合计金额控件：默认填所有发票金额之和；若指定了自定义报销金额则填该值（≤发票合计，由上层校验）。
+  // 该字段也用于审批条件分流，必须填，否则默认走高限额分支。
   if (cfg.sumField && !isPlaceholder(cfg.sumField.widgetId) && (!cfg.sumField.modes || cfg.sumField.modes.includes(mode))) {
-    const total = invoices.reduce((s, v) => s + (parseFloat((v.amount || '0').replace(/[^\d.-]/g, '')) || 0), 0);
+    const invoiceTotal = invoices.reduce((s, v) => s + (parseFloat((v.amount || '0').replace(/[^\d.-]/g, '')) || 0), 0);
+    const total = claimAmount != null ? claimAmount : invoiceTotal;
     form.push({ id: cfg.sumField.widgetId, type: cfg.sumField.widgetType, value: total.toFixed(2) });
   }
 

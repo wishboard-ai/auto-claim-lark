@@ -39,6 +39,8 @@ export interface PendingClaim {
   loan?: LoanReference;
   loanCandidates?: LoanReference[];
   pendingReason?: string;
+  /** 自定义本次报销/核销金额（元）。undefined 表示默认=发票合计。必须 ≤ 发票合计。 */
+  claimAmount?: number;
 }
 
 /** 待确认草稿：LLM 整理出的文案与类别，用户可在确认前修改类别/事由。 */
@@ -66,6 +68,7 @@ export function addItem(openId: string, item: CartItem): PendingClaim {
     existing.loan = undefined;
     existing.loanCandidates = undefined;
     existing.pendingReason = undefined;
+    existing.claimAmount = undefined; // 发票合计变化，重置自定义金额为默认(全部)
     return existing;
   }
   // 正常流程会先选择模式；兜底按费用报销，避免旧调用方产生无效会话。
@@ -95,6 +98,14 @@ export function setCollecting(openId: string, on: boolean): void {
   const c = getPending(openId);
   if (!c) return;
   c.collectingAttachments = on;
+  c.createdAt = Date.now();
+}
+
+/** 设定自定义报销/核销金额（元）；传 undefined 恢复默认(全部)。 */
+export function setClaimAmount(openId: string, amount: number | undefined): void {
+  const c = getPending(openId);
+  if (!c) return;
+  c.claimAmount = amount;
   c.createdAt = Date.now();
 }
 
