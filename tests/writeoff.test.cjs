@@ -161,7 +161,7 @@ test('核销审批通过事件只确认本次金额、展示余额并保持幂�
   store.recordSubmitted('loan-1', 'writeoff-1', 'open-1', 'chat-1', 40, 100);
   const sent = [];
   const client = { im: { v1: { message: { create: async (payload) => sent.push(payload) } } } };
-  const cfg = { approvalCode: 'writeoff-code', writeOff: { enabled: true } };
+  const cfg = { approvalCode: 'writeoff-code', writeOff: { enabled: true }, invoiceScan: { enabled: false } };
   const handler = makeApprovalStatusHandler(client, cfg, store);
   await handler({ approval_code: 'writeoff-code', instance_code: 'writeoff-1', status: 'APPROVED' });
   assert.deepEqual(store.amounts('loan-1'), { writtenOff: 40, pending: 0 });
