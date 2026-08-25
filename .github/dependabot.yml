@@ -16,6 +16,19 @@ updates:
     directory: "/ocr"
     schedule:
       interval: "weekly"
+    # The OCR stack is intentionally pinned (see comments in ocr/requirements.txt):
+    #   - paddleocr / paddlepaddle are held at 2.x; 3.x changes the predict API and
+    #     must be validated on a real machine before adopting.
+    #   - opencv 5.x requires numpy>=2, but numpy is pinned <2 here.
+    # Ignore major bumps for these so Dependabot stops proposing breaking upgrades;
+    # still allow minor/patch updates. Remove an entry when ready to migrate.
+    ignore:
+      - dependency-name: "paddleocr"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "paddlepaddle"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "opencv-python-headless"
+        update-types: ["version-update:semver-major"]
 
   # GitHub Actions workflows (.github/workflows)
   - package-ecosystem: "github-actions"
