@@ -62,6 +62,20 @@ export function makeMessageHandler(
     });
   }
 
+  // 识别耗时滚动均值(ms) + 每用户「待识别」队列深度：用于给用户「已收到/预计处理时间(含排队)」回执。
+  let avgRecognizeMs = 30000;
+  const recognizeSamples: number[] = [];
+  function recordRecognizeMs(ms: number): void {
+    if (!(ms > 0) || ms > 10 * 60_000) return; // 异常值忽略
+    recognizeSamples.push(ms);
+    if (recognizeSamples.length > 8) recognizeSamples.shift();
+    avgRecognizeMs = Math.round(recognizeSamples.reduce((a, b) => a + b, 0) / recognizeSamples.length);
+  }
+  const pendingCounts = new Map<string, number>();
+  function fmtEta(ms: number): string {
+    return ms < 60_000 ? `约 ${Math.max(1, Math.round(ms / 1000))} 秒` : `约 ${Math.round(ms / 60_000)} 分钟`;
+  }
+
   async function sendCard(chatId: string, card: string): Promise<void> {
     await client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
@@ -385,8 +399,11 @@ export function makeMessageHandler(
     chatId: string,
     recognize: () => Promise<RecognizedInvoice>
   ): Promise<RecognizedInvoice | null> {
+    const t0 = Date.now();
     try {
-      return await recognize();
+      const result = await recognize();
+      recordRecognizeMs(Date.now() - t0);
+      return result;
     } catch (e) {
       if (e instanceof QuotaExceededError) {
         await sendText(
@@ -624,6 +641,17 @@ export function makeMessageHandler(
     // 既避免长连接超时(>3s)重推重复处理，又保证顺序：事由不会抢在图片识别完成前处理、
     // 多张发票严格按发送顺序累加。
     const key = openId || chatId;
+    // 发票类消息（非附件模式）识别较慢：先即时回执「已收到 + 预计处理时间(含排队)」。
+    const isMedia = msgType === 'image' || msgType === 'file';
+    const ackSession = openId ? getPending(openId) : undefined;
+    const trackRecognition = isMedia && !!ackSession && !ackSession.collectingAttachments;
+    if (trackRecognition) {
+      const ahead = pendingCounts.get(key) ?? 0;
+      pendingCounts.set(key, ahead + 1);
+      const etaText = fmtEta((ahead + 1) * avgRecognizeMs);
+      const queueText = ahead > 0 ? `（前面还有 ${ahead} 个在排队）` : '';
+      void sendText(chatId, `🧾 已收到，正在识别处理…预计 ${etaText}${queueText}，完成后回复结果。`).catch(() => undefined);
+    }
     enqueue(key, async () => {
       try {
         const session = openId ? getPending(openId) : undefined;
@@ -647,6 +675,12 @@ export function makeMessageHandler(
           await sendText(chatId, `处理失败：${(e as Error).message}`);
         } catch {
           /* 忽略二次失败 */
+        }
+      } finally {
+        if (trackRecognition) {
+          const n = (pendingCounts.get(key) ?? 1) - 1;
+          if (n <= 0) pendingCounts.delete(key);
+          else pendingCounts.set(key, n);
         }
       }
     });
