@@ -135,7 +135,7 @@ export function loadConfig(): AppConfig {
     enabled: ['1', 'true', 'yes', 'on'].includes(opt('LOAN_WRITE_OFF_ENABLED', 'false').toLowerCase()),
     ledgerPath: opt('LOAN_WRITE_OFF_LEDGER_PATH', 'data/loan-writeoff-ledger.json'),
     loanApprovalCode: opt('LOAN_APPROVAL_CODE', 'FC505937-DA1D-471E-AC90-13C7AEB306B7'),
-    lookbackDays: Math.max(1, Number(opt('LOAN_LOOKBACK_DAYS', '365')) || 365),
+    lookbackDays: Math.max(1, Number(opt('LOAN_LOOKBACK_DAYS', '120')) || 120),
   };
   const invoiceScan: InvoiceScanConfig = {
     enabled: ['1', 'true', 'yes', 'on'].includes(opt('EXTERNAL_INVOICE_SCAN_ENABLED', 'false').toLowerCase()),
