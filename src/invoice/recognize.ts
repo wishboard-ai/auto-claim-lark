@@ -50,6 +50,38 @@ function normAmount(v?: unknown): string | undefined {
   return m ? m[0] : undefined;
 }
 
+/**
+ * 增值税发票「价税合计」纠偏。模型偶尔把不含税金额（税前小计）填进 amount，导致少报。
+ * 规则：给定 amount、netAmount(不含税)、taxAmount(税额)，当三者都可用且：
+ *   - net + tax 明显大于当前 amount（差额 > 0.02，排除四舍五入误差），且
+ *   - 当前 amount 与 net 基本相等（说明填成了税前值）
+ * 时，用 net + tax（含税合计）替换 amount。其余情况保持模型给出的 amount 不变。
+ * 返回归一化后的两位小数字符串；无法纠偏则原样返回入参 amount。
+ */
+function reconcileVatAmount(
+  amount?: string,
+  netAmount?: string,
+  taxAmount?: string
+): string | undefined {
+  const a = amount != null ? Number(amount) : NaN;
+  const net = netAmount != null ? Number(netAmount) : NaN;
+  const tax = taxAmount != null ? Number(taxAmount) : NaN;
+  if (!Number.isFinite(net) || !Number.isFinite(tax) || tax <= 0) return amount;
+  const gross = net + tax;
+  // amount 缺失或非法：直接采用含税合计
+  if (!Number.isFinite(a) || a <= 0) return gross.toFixed(2);
+  // amount 已接近含税合计：认为正确，不动
+  if (Math.abs(a - gross) <= 0.02) return amount;
+  // amount 接近不含税金额，且含税合计更大：判定为“把税前当成了价税合计”，纠正为含税合计
+  if (Math.abs(a - net) <= 0.02 && gross - a > 0.02) {
+    logger.warn(
+      `价税合计纠偏：amount ${a.toFixed(2)}（疑为不含税）→ ${gross.toFixed(2)}（不含税 ${net.toFixed(2)} + 税额 ${tax.toFixed(2)}）`
+    );
+    return gross.toFixed(2);
+  }
+  return amount;
+}
+
 function normDate(v?: unknown): string | undefined {
   if (v == null) return undefined;
   const s = String(v);
@@ -175,10 +207,18 @@ function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
   }
 
   const { invoiceNo, invoiceCode } = resolveNoAndCode(type, parsed.invoiceNo, parsed.invoiceCode);
+  const netAmount = normAmount(parsed.netAmount);
+  const taxAmount = normAmount(parsed.taxAmount);
+  let amount = normAmount(parsed.amount);
+  // 价税合计纠偏（仅增值税发票）：模型偶尔把「不含税金额」误当作 amount。
+  // 若有不含税金额与税额，且 net+tax 明显大于当前 amount（≈等于 net），则改用含税合计，避免少报。
+  if (type === 'vat') {
+    amount = reconcileVatAmount(amount, netAmount, taxAmount);
+  }
   const invoice: RecognizedInvoice = {
     type,
     typeLabel: strOrUndef(parsed.typeLabel) || TYPE_LABELS[type],
-    amount: normAmount(parsed.amount),
+    amount,
     date: normDate(parsed.date),
     sellerName:
       strOrUndef(parsed.sellerName) || (type === 'train' ? '中国铁路' : type === 'taxi' ? '出租车' : undefined),
@@ -186,7 +226,7 @@ function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
     invoiceNo,
     invoiceCode,
     checkCode: strOrUndef(parsed.checkCode),
-    taxAmount: normAmount(parsed.taxAmount),
+    taxAmount,
     summary: strOrUndef(parsed.summary),
     raw: normalizeRaw(parsed),
   };
@@ -219,6 +259,8 @@ const FIELD_SPEC =
   '严禁取「金额」列或不含税的「合计」小计（那是税前金额，通常比价税合计小）；\n' +
   '  · 火车票/出租车/网约车：取实付总额（含税）；\n' +
   '  · 若同时出现「金额/合计（不含税）」与「价税合计（含税）」两个数，一律取较大的价税合计；\n' +
+  '- netAmount: 不含税金额（元，仅增值税发票，即「合计金额（不含税）」/「金额」列小计，只要数字，无则留空）。' +
+  '注意 netAmount 与 amount 的区别：amount 是含税的价税合计，netAmount 是税前小计，两者一般不相等（amount = netAmount + 合计税额）；\n' +
   '- date: 开票/乘车日期，格式 YYYY-MM-DD；\n' +
   '- sellerName: 销售方/商家/承运方名称；\n' +
   '- buyerName: 购买方名称（无则留空）；\n' +
@@ -230,7 +272,7 @@ const FIELD_SPEC =
   '- summary: 摘要（如 出发站→到达站、车次、里程、时间等，无则留空）。\n' +
   '严禁编造{SRC}中不存在的信息，找不到的字段填空字符串。\n' +
   '返回示例：{"type":"train","amount":"553.5","date":"2024-01-15","sellerName":"中国铁路",' +
-  '"buyerName":"","invoiceNo":"E123456789","invoiceCode":"","checkCode":"","taxAmount":"",' +
+  '"buyerName":"","invoiceNo":"E123456789","invoiceCode":"","checkCode":"","taxAmount":"","netAmount":"",' +
   '"summary":"北京南→上海虹桥 G1 二等座"}';
 
 const EXTRACT_PROMPT =
