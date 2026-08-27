@@ -85,11 +85,14 @@ function reconcileVatAmount(
 
 /**
  * 用发票二维码数据交叉校正 OCR 识别结果（仅增值税发票）。
- * 二维码里的发票号码/代码/开票日期是机器编码，比 OCR 读票面文字更可信，用于校正这三项。
- * 二维码金额是【不含税】小计：
- *   - 若 OCR 未取到不含税金额，则用二维码金额补 net，并据此重算价税合计（net + 税额）；
- *   - 若价税合计缺失但有二维码 net 与 OCR 税额，也可据此补齐。
- * 该函数只增强不破坏：任何字段缺失/冲突不大时保持 OCR 原值。
+ * - 发票号码/代码/开票日期：二维码是机器编码，比 OCR 读票面文字更可信，用于校正这三项。
+ * - 金额：二维码第 5 段金额（全电发票实测为含税价税合计）。不预设含税/不含税，而是与 OCR 的
+ *   价税合计 / 不含税金额 / 税额逐一勾稽比对，判定其含义后再决定是否用于校正 amount：
+ *     · 若二维码金额 ≈ OCR价税合计       → 相互印证，保持；
+ *     · 若二维码金额 ≈ OCR(不含税+税额)  → 即价税合计，用它校正/补全 amount；
+ *     · 若 OCR 缺价税合计但有不含税与税额，且三者能对上 → 补全 amount = 二维码金额；
+ *     · 都对不上（含义不明/疑似不含税等）→ 不用二维码改金额，避免算错。
+ * 该函数只增强不破坏：任何字段缺失/无法判定时保持 OCR 原值。
  */
 function applyQrToInvoice(invoice: RecognizedInvoice, qr: InvoiceQrData): RecognizedInvoice {
   if (invoice.type !== 'vat') return invoice;
@@ -115,21 +118,36 @@ function applyQrToInvoice(invoice: RecognizedInvoice, qr: InvoiceQrData): Recogn
     out.date = qr.date;
   }
 
-  // 金额交叉校验：二维码金额是不含税小计。据此重算/校正含税价税合计。
-  const qrNet = qr.netAmount != null ? Number(qr.netAmount) : NaN;
-  const tax = out.taxAmount != null ? Number(out.taxAmount) : NaN;
-  if (Number.isFinite(qrNet) && qrNet > 0) {
-    // 用二维码 net 结合 OCR 税额重算价税合计；缺税额时无法重算，仅记录 net。
-    if (Number.isFinite(tax) && tax >= 0) {
-      const gross = (qrNet + tax).toFixed(2);
-      const cur = out.amount != null ? Number(out.amount) : NaN;
-      if (!Number.isFinite(cur) || Math.abs(cur - Number(gross)) > 0.02) {
-        if (out.amount) corrections.push(`价税合计 ${out.amount}→${gross}(二维码net ${qrNet.toFixed(2)}+税 ${tax.toFixed(2)})`);
-        else corrections.push(`价税合计 补=${gross}`);
+  // 金额勾稽：先判定二维码金额的含义，再决定是否用于校正 amount。绝不无脑做加减。
+  const near = (a: number, b: number) => Math.abs(a - b) <= 0.02;
+  const qrAmt = qr.amount != null ? Number(qr.amount) : NaN;
+  if (Number.isFinite(qrAmt) && qrAmt > 0) {
+    out.raw.qrAmount = qrAmt.toFixed(2);
+    const ocrGross = out.amount != null ? Number(out.amount) : NaN; // OCR 价税合计
+    const net = (out.raw.netAmount != null ? Number(out.raw.netAmount) : NaN); // OCR 不含税
+    const tax = out.taxAmount != null ? Number(out.taxAmount) : NaN; // OCR 税额
+    const netPlusTax = Number.isFinite(net) && Number.isFinite(tax) ? net + tax : NaN;
+
+    if (Number.isFinite(ocrGross) && near(ocrGross, qrAmt)) {
+      // 二维码金额与 OCR 价税合计一致：相互印证，无需改。
+    } else if (Number.isFinite(netPlusTax) && near(qrAmt, netPlusTax)) {
+      // 二维码金额 = 不含税 + 税额 = 价税合计。若 OCR 的 amount 与之不符则以二维码为准校正。
+      const gross = qrAmt.toFixed(2);
+      if (!Number.isFinite(ocrGross) || !near(ocrGross, qrAmt)) {
+        if (out.amount) corrections.push(`价税合计 ${out.amount}→${gross}(二维码，与不含税+税额一致)`);
+        else corrections.push(`价税合计 补=${gross}(二维码)`);
         out.amount = gross;
       }
+    } else if (!Number.isFinite(ocrGross) && !Number.isFinite(netPlusTax)) {
+      // OCR 完全没给出可用金额：二维码金额（全电为含税）作为兜底补全。
+      out.amount = qrAmt.toFixed(2);
+      corrections.push(`价税合计 补=${out.amount}(二维码，OCR无金额)`);
+    } else {
+      // 含义无法确认（与 OCR 各金额都对不上）：不用二维码改金额，仅记录备查。
+      logger.info(
+        `二维码金额 ${qrAmt.toFixed(2)} 与 OCR 金额未对齐（价税合计=${out.amount ?? '-'} 不含税=${out.raw.netAmount ?? '-'} 税额=${out.taxAmount ?? '-'}），不据此改金额`
+      );
     }
-    out.raw.qrNetAmount = qrNet.toFixed(2);
   }
   out.raw.qrRaw = qr.raw;
 

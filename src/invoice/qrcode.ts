@@ -12,21 +12,37 @@ import { logger } from '../logger';
 
 /** 增值税发票二维码解析出的字段（均为票面机器编码，较 OCR 更可信）。 */
 export interface InvoiceQrData {
+  /** 版本/票种标志位（二维码第 2 段，如 08/10 传统票、32 全电发票） */
+  version?: string;
   /** 发票代码（全电发票通常为空） */
   invoiceCode?: string;
   /** 发票号码 */
   invoiceNo?: string;
-  /** 不含税金额（注意：增值税发票二维码里的金额是税前小计，不是价税合计） */
-  netAmount?: string;
+  /**
+   * 二维码金额（第 5 段）。实测全电发票(版本 32)此段为【含税价税合计】。
+   * 但不同年代/票种口径不完全一致，故此处只如实保留数字，不预设含税/不含税；
+   * 由上层用 OCR 的价税合计/不含税/税额做勾稽比对来判定其含义。
+   */
+  amount?: string;
   /** 开票日期，归一化为 YYYY-MM-DD */
   date?: string;
   /** 原始二维码文本，便于调试 */
   raw: string;
 }
 
+/** 归一化二维码日期：兼容 8 位纯数字(YYYYMMDD) 与已带分隔符(YYYY-MM-DD / YYYY/MM/DD)。 */
+function normalizeQrDate(raw: string): string | undefined {
+  const s = raw.trim();
+  if (/^\d{8}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+  const m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  return undefined;
+}
+
 /**
- * 解析增值税发票二维码明文。典型格式为逗号分隔：
- *   01,<版本>,<发票代码>,<发票号码>,<不含税金额>,<开票日期YYYYMMDD>,<校验码后6位>,<其他>
+ * 解析增值税发票二维码明文。逗号分隔，字段位置：
+ *   [0]标志"01" [1]版本/票种(08/10/32...) [2]发票代码(全电常为空) [3]发票号码
+ *   [4]金额(全电为含税价税合计) [5]开票日期 [6]校验码后6位 [7...]其他
  * 仅当以 "01," 开头且字段数足够时才解析；否则返回 undefined（可能是火车票等非此格式）。
  */
 export function parseVatQrText(text: string): InvoiceQrData | undefined {
@@ -35,6 +51,7 @@ export function parseVatQrText(text: string): InvoiceQrData | undefined {
   const parts = t.split(',');
   if (parts.length < 7) return undefined;
 
+  const version = (parts[1] || '').trim() || undefined;
   const codeRaw = (parts[2] || '').trim();
   const noRaw = (parts[3] || '').trim();
   const amtRaw = (parts[4] || '').trim();
@@ -42,14 +59,12 @@ export function parseVatQrText(text: string): InvoiceQrData | undefined {
 
   const invoiceCode = /^\d{10,12}$/.test(codeRaw) ? codeRaw : undefined;
   const invoiceNo = /^\d{8}$|^\d{20}$/.test(noRaw) ? noRaw : undefined;
-  const netAmount = /^\d+(\.\d+)?$/.test(amtRaw) && Number(amtRaw) > 0 ? amtRaw : undefined;
-  const date = /^\d{8}$/.test(dateRaw)
-    ? `${dateRaw.slice(0, 4)}-${dateRaw.slice(4, 6)}-${dateRaw.slice(6, 8)}`
-    : undefined;
+  const amount = /^\d+(\.\d+)?$/.test(amtRaw) && Number(amtRaw) > 0 ? amtRaw : undefined;
+  const date = normalizeQrDate(dateRaw);
 
   // 至少要解出号码或代码之一才算有效
   if (!invoiceNo && !invoiceCode) return undefined;
-  return { invoiceCode, invoiceNo, netAmount, date, raw: t };
+  return { version, invoiceCode, invoiceNo, amount, date, raw: t };
 }
 
 /**
