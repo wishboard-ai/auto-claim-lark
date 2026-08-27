@@ -4,6 +4,7 @@ import { logger } from '../logger';
 import { fetchWithTimeout } from '../util/http';
 import { isPdf, extractPdfText, hasUsableText, pdfFirstPageToImage } from './pdf';
 import { isHeic, heicToJpeg, isOfd, extractOfdText, isZip, extractArchiveFiles } from './formats';
+import { extractInvoiceQr, InvoiceQrData } from './qrcode';
 
 /** OCR 前预处理图片：HEIC/HEIF 转 JPEG（视觉模型/本地OCR无法直接读取）。其余原样返回。 */
 async function prepOcrImage(buf: Buffer): Promise<Buffer> {
@@ -80,6 +81,80 @@ function reconcileVatAmount(
     return gross.toFixed(2);
   }
   return amount;
+}
+
+/**
+ * 用发票二维码数据交叉校正 OCR 识别结果（仅增值税发票）。
+ * 二维码里的发票号码/代码/开票日期是机器编码，比 OCR 读票面文字更可信，用于校正这三项。
+ * 二维码金额是【不含税】小计：
+ *   - 若 OCR 未取到不含税金额，则用二维码金额补 net，并据此重算价税合计（net + 税额）；
+ *   - 若价税合计缺失但有二维码 net 与 OCR 税额，也可据此补齐。
+ * 该函数只增强不破坏：任何字段缺失/冲突不大时保持 OCR 原值。
+ */
+function applyQrToInvoice(invoice: RecognizedInvoice, qr: InvoiceQrData): RecognizedInvoice {
+  if (invoice.type !== 'vat') return invoice;
+  const out: RecognizedInvoice = { ...invoice, raw: { ...invoice.raw } };
+  const corrections: string[] = [];
+
+  // 发票号码：二维码更可信。OCR 缺失或与二维码不一致时，采用二维码值。
+  if (qr.invoiceNo && qr.invoiceNo !== out.invoiceNo) {
+    if (out.invoiceNo) corrections.push(`号码 ${out.invoiceNo}→${qr.invoiceNo}`);
+    else corrections.push(`号码 补=${qr.invoiceNo}`);
+    out.invoiceNo = qr.invoiceNo;
+  }
+  // 发票代码：同上（全电发票二维码可能无代码，则不动）。
+  if (qr.invoiceCode && qr.invoiceCode !== out.invoiceCode) {
+    if (out.invoiceCode) corrections.push(`代码 ${out.invoiceCode}→${qr.invoiceCode}`);
+    else corrections.push(`代码 补=${qr.invoiceCode}`);
+    out.invoiceCode = qr.invoiceCode;
+  }
+  // 开票日期：二维码日期无歧义，OCR 缺失或不一致时采用。
+  if (qr.date && qr.date !== out.date) {
+    if (out.date) corrections.push(`日期 ${out.date}→${qr.date}`);
+    else corrections.push(`日期 补=${qr.date}`);
+    out.date = qr.date;
+  }
+
+  // 金额交叉校验：二维码金额是不含税小计。据此重算/校正含税价税合计。
+  const qrNet = qr.netAmount != null ? Number(qr.netAmount) : NaN;
+  const tax = out.taxAmount != null ? Number(out.taxAmount) : NaN;
+  if (Number.isFinite(qrNet) && qrNet > 0) {
+    // 用二维码 net 结合 OCR 税额重算价税合计；缺税额时无法重算，仅记录 net。
+    if (Number.isFinite(tax) && tax >= 0) {
+      const gross = (qrNet + tax).toFixed(2);
+      const cur = out.amount != null ? Number(out.amount) : NaN;
+      if (!Number.isFinite(cur) || Math.abs(cur - Number(gross)) > 0.02) {
+        if (out.amount) corrections.push(`价税合计 ${out.amount}→${gross}(二维码net ${qrNet.toFixed(2)}+税 ${tax.toFixed(2)})`);
+        else corrections.push(`价税合计 补=${gross}`);
+        out.amount = gross;
+      }
+    }
+    out.raw.qrNetAmount = qrNet.toFixed(2);
+  }
+  out.raw.qrRaw = qr.raw;
+
+  if (corrections.length) {
+    logger.info(`二维码交叉校正：${corrections.join('；')}`);
+  }
+  return out;
+}
+
+/**
+ * 若提供了发票图片字节，尝试解析二维码并交叉校正识别结果（仅对增值税发票有意义）。
+ * 无二维码/解析失败时原样返回 invoice，绝不影响主识别流程。
+ */
+async function enhanceWithQr(
+  invoice: RecognizedInvoice,
+  imageBuffer?: Buffer
+): Promise<RecognizedInvoice> {
+  if (!imageBuffer || invoice.type !== 'vat') return invoice;
+  try {
+    const qr = await extractInvoiceQr(imageBuffer);
+    if (qr) return applyQrToInvoice(invoice, qr);
+  } catch (e) {
+    logger.warn('二维码增强失败（忽略，用 OCR 结果）：', (e as Error).message);
+  }
+  return invoice;
 }
 
 function normDate(v?: unknown): string | undefined {
@@ -377,10 +452,11 @@ async function recognizeViaOpenAI(cfg: AppConfig, file: Buffer): Promise<Recogni
   const img = await prepOcrImage(file);
   const dataUri = `data:${mimeForImage(img)};base64,${img.toString('base64')}`;
   logger.info(`调用 OCR 识别（provider=openai, model=${ocr.model}, 图片 ${img.length} 字节）…`);
-  return openAIChatToInvoice(cfg, [
+  const invoice = await openAIChatToInvoice(cfg, [
     { type: 'image_url', image_url: { url: dataUri } },
     { type: 'text', text: EXTRACT_PROMPT },
   ]);
+  return enhanceWithQr(invoice, img);
 }
 
 /** 文本型 PDF：把提取到的文字层交给文本模型抽取（openai provider）。 */
@@ -496,7 +572,7 @@ async function recognizeViaPaddle(cfg: AppConfig, file: Buffer): Promise<Recogni
     return { type: 'unknown', typeLabel: '未知票据', raw: {} };
   }
   logger.debug(`PaddleOCR 返回：${JSON.stringify(parsed).slice(0, 500)}`);
-  return buildFromParsed(parsed);
+  return enhanceWithQr(buildFromParsed(parsed), img);
 }
 
 /** 文本型 PDF：把文字层交给本地 PaddleOCR 服务的 /recognize_text（复用其规则抽取，免栅格化）。 */
@@ -563,7 +639,20 @@ export async function recognizeInvoiceFromText(cfg: AppConfig, text: string): Pr
 export async function recognizeFile(cfg: AppConfig, buf: Buffer): Promise<RecognizedInvoice> {
   if (isPdf(buf)) {
     const text = await extractPdfText(buf);
-    if (hasUsableText(text)) return recognizeInvoiceFromText(cfg, text);
+    if (hasUsableText(text)) {
+      // 文本型 PDF：文字层足以抽取字段，无需栅格化做 OCR。
+      // 但二维码在页面图像里，故对增值税发票额外栅格化首页做一次二维码交叉校正。
+      const invoice = await recognizeInvoiceFromText(cfg, text);
+      if (invoice.type !== 'vat') return invoice;
+      try {
+        const pageImg = await pdfFirstPageToImage(buf);
+        return await enhanceWithQr(invoice, pageImg);
+      } catch (e) {
+        logger.warn('文本型 PDF 栅格化取二维码失败（忽略）：', (e as Error).message);
+        return invoice;
+      }
+    }
+    // 图片型 PDF：栅格化后走视觉识别，recognizeInvoice 内部已含二维码增强。
     return recognizeInvoice(cfg, await pdfFirstPageToImage(buf));
   }
   if (await isOfd(buf)) {
