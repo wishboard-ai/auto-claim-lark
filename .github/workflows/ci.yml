@@ -38,3 +38,12 @@ jobs:
 
       - name: Test
         run: npm test
+
+      # ocr/extract.py 的规则抽取单测：只依赖标准库，无需安装 paddle。
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Test OCR rules (Python)
+        run: python -m unittest discover -s ocr -p "test_*.py" -v
