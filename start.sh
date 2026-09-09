@@ -91,7 +91,6 @@ ensure_model() {
   fi
 }
 
-OCR_PROVIDER_V="$(envval OCR_PROVIDER)"; OCR_PROVIDER_V="${OCR_PROVIDER_V:-openai}"
 OCR_BASE_V="$(envval OCR_BASE_URL)"
 LLM_BASE_V="$(envval LLM_BASE_URL)"
 OCR_MODEL_V="$(envval OCR_MODEL)"
@@ -101,8 +100,8 @@ OCR_EFF_BASE="${OCR_BASE_V:-$LLM_BASE_V}"
 
 NEED_MODELS=()
 NEED_OLLAMA=0
-# 识别走本地 Ollama（provider=openai 且有效 base 指向本地）
-if [ "$OCR_PROVIDER_V" != "paddle" ] && is_local_ollama "$OCR_EFF_BASE"; then
+# 识别走本地 Ollama（有效 base 指向本地 11434）
+if is_local_ollama "$OCR_EFF_BASE"; then
   NEED_OLLAMA=1
   [ -n "$OCR_MODEL_V" ] && NEED_MODELS+=("$OCR_MODEL_V")
 fi
@@ -122,17 +121,6 @@ if [ "$NEED_OLLAMA" = "1" ]; then
     fi
   else
     echo "[Ollama] 环境未就绪，识别可能失败。请手动安装/启动 Ollama 后重试。"
-  fi
-fi
-
-# paddle 模式：检查本地 PaddleOCR 服务是否就绪（仅提示，不阻断）
-if [ "$OCR_PROVIDER_V" = "paddle" ]; then
-  PBASE="${OCR_BASE_V:-http://localhost:8000}"
-  if curl -fsS "${PBASE%/}/health" >/dev/null 2>&1; then
-    echo "[PaddleOCR] 本地 OCR 服务已就绪：$PBASE"
-  else
-    echo "[PaddleOCR] 本地 OCR 服务（$PBASE）未就绪！请另开终端启动： cd ocr && ./start-ocr.sh"
-    echo "            或用 deploy/com.autoclaim.ocr.plist 设为开机自启。否则识别会连接失败。"
   fi
 fi
 

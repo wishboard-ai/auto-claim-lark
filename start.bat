@@ -69,13 +69,8 @@ if not errorlevel 1 (
       timeout /t 3 >nul
     )
     rem 解析并拉取所需模型
-    set "OCR_PROVIDER_V=openai"
-    call :getenv OCR_PROVIDER
-    if defined ENVVAL set "OCR_PROVIDER_V=!ENVVAL!"
-    if /i not "!OCR_PROVIDER_V!"=="paddle" (
-      call :getenv OCR_MODEL
-      if defined ENVVAL call :ensuremodel "!ENVVAL!"
-    )
+    call :getenv OCR_MODEL
+    if defined ENVVAL call :ensuremodel "!ENVVAL!"
     call :getenv LLM_MODEL
     if defined ENVVAL call :ensuremodel "!ENVVAL!"
   )

@@ -1,6 +1,6 @@
 # Intel + AMD 显卡 Mac 上用 GPU 跑视觉模型（llama.cpp + Vulkan/MoltenVK）
 
-给「Intel CPU + AMD 独显 + macOS」机器，用 **GPU** 跑 Qwen2.5-VL-3B 识别发票（替代 CPU 版 PaddleOCR）。
+给「Intel CPU + AMD 独显 + macOS」机器，用 **GPU** 跑 Qwen2.5-VL-3B 识别发票。
 本方案已在真实机器（AMD Radeon Pro 5300 / 8GB RAM / macOS 26）**实测跑通**。
 
 ## 实测结论（重要）
@@ -49,7 +49,6 @@ cmake --build ~/llama.cpp/build-vk --config Release -j 2
 ## 主服务 .env
 
 ```
-OCR_PROVIDER=openai
 OCR_BASE_URL=http://127.0.0.1:8080/v1
 OCR_API_KEY=llama          # 任意非空（llama-server 不校验，但本项目需非空才算启用）
 OCR_MODEL=qwen             # 任意；llama-server 用已加载的模型

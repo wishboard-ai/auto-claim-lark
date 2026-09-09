@@ -22,10 +22,10 @@ async function prepOcrImage(buf: Buffer): Promise<Buffer> {
 }
 
 /**
- * 发票识别。支持两种后端（OCR_PROVIDER）：
- * - openai：OpenAI 兼容的多模态大模型（云端 qwen-vl-max，或本地 Ollama 的 qwen2.5vl）。
- * - paddle：本地 PaddleOCR 微服务（见 ocr/ocr_service.py），零 API 成本、适合低配机器。
- * 两种后端都产出统一的结构化 JSON，经同一 buildFromParsed 归一化为 RecognizedInvoice。
+ * 发票识别。后端为 OpenAI 兼容的多模态大模型：云端（qwen-vl-max 等），
+ * 或本地（Ollama 的 qwen2.5vl、llama.cpp server），由 OCR_BASE_URL / OCR_MODEL 决定。
+ * 图片走视觉识别、文本型 PDF 走文字层识别，两条路径都产出统一的结构化 JSON，
+ * 经同一 buildFromParsed 归一化为 RecognizedInvoice。
  */
 
 /** 识别额度/费用相关错误（额度用尽、欠费、限流）。用于向用户回复明确提示。 */
@@ -345,7 +345,7 @@ const TYPE_LABELS: Record<Exclude<InvoiceType, 'unknown'>, string> = {
   taxi: '出租车票',
 };
 
-/** 统一映射：结构化对象 -> RecognizedInvoice（两种 provider 共用；导出以便单测归一化逻辑）。 */
+/** 统一映射：结构化对象 -> RecognizedInvoice（图片/文本两条路径共用；导出以便单测归一化逻辑）。 */
 export function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
   const rawType = String(parsed.type || '').toLowerCase();
   const type: InvoiceType =
@@ -397,7 +397,7 @@ function normalizeRaw(parsed: Record<string, unknown>): Record<string, string> {
   return raw;
 }
 
-// ============ provider: openai（多模态大模型） ============
+// ============ OCR 调用（OpenAI 兼容接口） ============
 
 // 字段抽取规则（图片识别与文本识别共用）。「图片/票面」措辞用占位符 {SRC} 适配两种输入。
 const FIELD_SPEC =
@@ -532,7 +532,7 @@ async function recognizeViaOpenAI(cfg: AppConfig, file: Buffer): Promise<Recogni
   const { ocr } = cfg;
   const img = await prepOcrImage(file);
   const dataUri = `data:${mimeForImage(img)};base64,${img.toString('base64')}`;
-  logger.info(`调用 OCR 识别（provider=openai, model=${ocr.model}, 图片 ${img.length} 字节）…`);
+  logger.info(`调用 OCR 识别（model=${ocr.model}, 图片 ${img.length} 字节）…`);
   const invoice = await openAIChatToInvoice(cfg, [
     { type: 'image_url', image_url: { url: dataUri } },
     { type: 'text', text: EXTRACT_PROMPT },
@@ -540,10 +540,10 @@ async function recognizeViaOpenAI(cfg: AppConfig, file: Buffer): Promise<Recogni
   return enhanceWithQr(invoice, img);
 }
 
-/** 文本型 PDF：把提取到的文字层交给文本模型抽取（openai provider）。 */
+/** 文本型 PDF：把提取到的文字层交给文本模型抽取。 */
 async function recognizeTextViaOpenAI(cfg: AppConfig, text: string): Promise<RecognizedInvoice> {
   const { ocr } = cfg;
-  logger.info(`调用文本识别（provider=openai, model=${ocr.model}, 文本 ${text.length} 字）…`);
+  logger.info(`调用文本识别（model=${ocr.model}, 文本 ${text.length} 字）…`);
   return openAIChatToInvoice(cfg, [
     { type: 'text', text: `${EXTRACT_PROMPT_TEXT}\n\n===== 发票文本 =====\n${text}` },
   ]);
@@ -614,100 +614,21 @@ async function openAIChatToInvoice(cfg: AppConfig, content: unknown): Promise<Re
   return buildFromParsed(parsed);
 }
 
-// ============ provider: paddle（本地 PaddleOCR 微服务） ============
-
-async function recognizeViaPaddle(cfg: AppConfig, file: Buffer): Promise<RecognizedInvoice> {
-  const { ocr } = cfg;
-  const url = `${ocr.baseUrl.replace(/\/$/, '')}/recognize`;
-  const img = await prepOcrImage(file);
-  logger.info(`调用 OCR 识别（provider=paddle, ${url}, 图片 ${img.length} 字节）…`);
-
-  let resp: Response;
-  try {
-    resp = await fetchWithTimeout(
-      url,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': mimeForImage(img) },
-        // Node 原生 fetch 接受 Uint8Array 作为 body；用 any 规避 DOM BodyInit 类型缺失
-        body: new Uint8Array(img) as any,
-      },
-      cfg.requestTimeoutMs
-    );
-  } catch (e) {
-    logger.warn('本地 PaddleOCR 服务连接失败：', (e as Error).message);
-    throw new Error(
-      `无法连接本地 OCR 服务 ${ocr.baseUrl}。请先启动 PaddleOCR 服务（见 ocr/README.md）。`
-    );
-  }
-
-  if (!resp.ok) {
-    const bodyText = await resp.text().catch(() => '');
-    logger.warn(`本地 PaddleOCR HTTP ${resp.status}：${bodyText.slice(0, 300)}`);
-    throw new Error(`本地 OCR 服务错误 HTTP ${resp.status}`);
-  }
-
-  const parsed: any = await resp.json().catch(() => null);
-  if (!parsed || typeof parsed !== 'object') {
-    logger.warn('本地 PaddleOCR 返回无法解析为 JSON');
-    return { type: 'unknown', typeLabel: '未知票据', raw: {} };
-  }
-  logger.debug(`PaddleOCR 返回：${JSON.stringify(parsed).slice(0, 500)}`);
-  return enhanceWithQr(buildFromParsed(parsed), img);
-}
-
-/** 文本型 PDF：把文字层交给本地 PaddleOCR 服务的 /recognize_text（复用其规则抽取，免栅格化）。 */
-async function recognizeTextViaPaddle(cfg: AppConfig, text: string): Promise<RecognizedInvoice> {
-  const { ocr } = cfg;
-  const url = `${ocr.baseUrl.replace(/\/$/, '')}/recognize_text`;
-  logger.info(`调用文本识别（provider=paddle, ${url}, 文本 ${text.length} 字）…`);
-
-  let resp: Response;
-  try {
-    resp = await fetchWithTimeout(
-      url,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-      },
-      cfg.requestTimeoutMs
-    );
-  } catch (e) {
-    logger.warn('本地 PaddleOCR 服务连接失败：', (e as Error).message);
-    throw new Error(
-      `无法连接本地 OCR 服务 ${ocr.baseUrl}。请先启动 PaddleOCR 服务（见 ocr/README.md）。`
-    );
-  }
-  if (!resp.ok) {
-    const bodyText = await resp.text().catch(() => '');
-    logger.warn(`本地 PaddleOCR /recognize_text HTTP ${resp.status}：${bodyText.slice(0, 300)}`);
-    throw new Error(`本地 OCR 服务错误 HTTP ${resp.status}`);
-  }
-  const parsed: any = await resp.json().catch(() => null);
-  if (!parsed || typeof parsed !== 'object') return { type: 'unknown', typeLabel: '未知票据', raw: {} };
-  return buildFromParsed(parsed);
-}
-
-// ============ 分发入口 ============
+// ============ 对外入口 ============
 
 /**
- * 识别发票：按 OCR_PROVIDER 选择后端。识别不出票种时返回 { type: 'unknown' }。
+ * 识别发票图片。识别不出票种时返回 { type: 'unknown' }。
  */
 export async function recognizeInvoice(cfg: AppConfig, file: Buffer): Promise<RecognizedInvoice> {
-  const { ocr } = cfg;
-  if (!ocr.enabled) throw new OcrNotConfiguredError();
-  if (ocr.provider === 'paddle') return recognizeViaPaddle(cfg, file);
+  if (!cfg.ocr.enabled) throw new OcrNotConfiguredError();
   return recognizeViaOpenAI(cfg, file);
 }
 
 /**
- * 从文本识别发票（用于文本型 PDF 的文字层）。按 OCR_PROVIDER 选择后端。
+ * 从文本识别发票（用于文本型 PDF / OFD 的文字层）。
  */
 export async function recognizeInvoiceFromText(cfg: AppConfig, text: string): Promise<RecognizedInvoice> {
-  const { ocr } = cfg;
-  if (!ocr.enabled) throw new OcrNotConfiguredError();
-  if (ocr.provider === 'paddle') return recognizeTextViaPaddle(cfg, text);
+  if (!cfg.ocr.enabled) throw new OcrNotConfiguredError();
   return recognizeTextViaOpenAI(cfg, text);
 }
 

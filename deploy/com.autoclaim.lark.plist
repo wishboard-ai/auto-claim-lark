@@ -16,9 +16,6 @@
          launchctl unload ~/Library/LaunchAgents/com.autoclaim.lark.plist  # 停止
   日志见 {{PROJECT_DIR}}/logs/ 下的 out.log / err.log
   如需临时禁用「启动时检查更新」，把下方 EnvironmentVariables 里的 SKIP_UPDATE 改为 1。
-
-  注意：本机器人（发票识别 + 审批）与本地 PaddleOCR 服务是两个进程。
-  若用 PaddleOCR 全本地方案，另建一份 launchd 让 ocr/start-ocr.sh 也开机自启。
 -->
 <plist version="1.0">
 <dict>

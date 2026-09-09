@@ -253,34 +253,14 @@ launchctl load ~/Library/LaunchAgents/com.autoclaim.lark.plist   # 启动并开�
 # 停止： launchctl unload ~/Library/LaunchAgents/com.autoclaim.lark.plist
 ```
 
-> 若用 PaddleOCR 全本地方案，OCR 是独立进程，另用 `deploy/com.autoclaim.ocr.plist` 让它一起开机自启。
 > 想临时关闭「启动时检查更新」，把 plist 里 `SKIP_UPDATE` 设为 `1`（或运行时 `SKIP_UPDATE=1 ./start.sh`）。
 
-> Intel 款 iMac（无 Apple Silicon）跑本地视觉模型较慢，建议改用下面的 **PaddleOCR 全本地方案**。
+> Intel 款 iMac（无 Apple Silicon）用 CPU 跑本地视觉模型较慢，建议看下面的 **4.2**：用 AMD 独显加速。
 
-### 4.2 全本地方案 B：PaddleOCR（适合低配 / Intel / 无 GPU，如 8GB iMac）
-
-不依赖大模型，用轻量 OCR 引擎，CPU 即可跑，内存占用小、零 API 成本。
-
-```bash
-# 1) 启动本地 PaddleOCR 服务（首次会建 venv、装依赖、下载模型）
-cd ocr && chmod +x start-ocr.sh && ./start-ocr.sh    # 自动选用 Python 3.12/3.11/3.10
-
-# 2) 主服务 .env 指向本地 OCR
-#   OCR_PROVIDER=paddle
-#   OCR_BASE_URL=http://localhost:8000
-#   （标题生成 LLM_* 可留空 → 回退模板；仍需填 FEISHU_*、APPROVAL_CODE）
-
-# 3) 另开一个终端启动主服务
-./start.sh
-```
-
-字段抽取为基于 OCR 文本的规则匹配，不同版式可能需微调，详见 `ocr/README.md`。
-
-### 4.3 全本地方案 C：Intel + AMD 显卡 Mac 用 GPU 跑视觉模型（llama.cpp + Vulkan）
+### 4.2 全本地方案 B：Intel + AMD 显卡 Mac 用 GPU 跑视觉模型（llama.cpp + Vulkan）
 
 若想用 AMD 独显加速、直接跑视觉大模型（识别更准，免规则调参），见 `deploy/llama-macos/README.md`：
-用 **llama.cpp + Vulkan(MoltenVK)** 起一个 OpenAI 兼容服务，`.env` 设 `OCR_PROVIDER=openai` + `OCR_BASE_URL=http://127.0.0.1:8080/v1` 即可。属实验性方案（4GB 显存偏小、需装 Vulkan SDK），请先小规模验证。
+用 **llama.cpp + Vulkan(MoltenVK)** 起一个 OpenAI 兼容服务，`.env` 设 `OCR_BASE_URL=http://127.0.0.1:8080/v1` 即可。属实验性方案（4GB 显存偏小、需装 Vulkan SDK），请先小规模验证。
 
 ## 5. 支持的票种
 
@@ -301,7 +281,7 @@ cd ocr && chmod +x start-ocr.sh && ./start-ocr.sh    # 自动选用 Python 3.12/
 - 小写 ≈ 不含税 + 税额 而大写与两者都对不上 → 判为大写误识，保留数字并告警；
 - 小写缺失/无法勾稽 → 采用大写值。
 
-优先级：**大写金额 > 二维码金额 > OCR 小写数字**。二维码金额与已被大写印证的合计冲突时不覆盖，只记日志。大写解析失败（含异常字符、只有阿拉伯数字等）一律返回空，绝不猜测。云端模型与本地 PaddleOCR 两条链路都会输出 `amountInWords`（Paddle 侧由 `ocr/extract.py` 的 `find_amount_in_words` 抓取）。
+优先级：**大写金额 > 二维码金额 > OCR 小写数字**。二维码金额与已被大写印证的合计冲突时不覆盖，只记日志。大写解析失败（含异常字符、只有阿拉伯数字等）一律返回空，绝不猜测。
 
 ### 二维码交叉校正（增值税发票）
 
@@ -326,7 +306,7 @@ src/
   types.ts                 共享类型（RecognizedInvoice 等）
   invoice/
     download.ts            下载消息中的图片资源
-    recognize.ts           发票识别分发（provider: openai 多模态大模型 / paddle 本地OCR）
+    recognize.ts           发票识别（OpenAI 兼容多模态大模型：云端 / 本地 Ollama、llama.cpp）
     qrcode.ts              发票二维码解析（@napi-rs/canvas + jsQR）：交叉校正号码/代码/日期与金额
     chineseAmount.ts       中文大写金额解析：用「价税合计（大写）」校正小写数字（最高优先级）
     dedup.ts               发票指纹与跨费用报销/借款核销持久化检重台账
@@ -347,17 +327,13 @@ scripts/
   inspect-approval.ts      查看审批定义的表单控件 ID
 config/
   field-mapping.json       字段映射配置（需填入 widgetId）
-ocr/                       本地 PaddleOCR 微服务（OCR_PROVIDER=paddle 时使用）
-  ocr_service.py           FastAPI：图片→PaddleOCR→规则抽取→JSON
-  requirements.txt         Python 依赖
-  start-ocr.sh             一键启动（建 venv、装依赖、跑服务）
 deploy/
   com.autoclaim.lark.plist  机器人：macOS launchd 常驻/开机自启（经 start.sh，含自更新）
-  com.autoclaim.ocr.plist   PaddleOCR 服务：launchd 常驻/开机自启（经 ocr/start-ocr.sh）
+  llama-macos/              Intel + AMD 显卡 Mac 用 llama.cpp + Vulkan 跑本地视觉模型
 ```
 
 ## 备注
 
 - **幂等**：以 `message_id` 去重，避免长连接超时重推导致重复创建。
 - **会话/消息去重为内存实现**：发票使用台账已持久化为 JSON；多实例部署时仍需将会话、消息去重及发票台账替换为带原子约束的共享存储（如 Redis/数据库）。长连接为集群单点接收，单实例即可稳定运行。
-- **票种识别**：由 qwen-vl-ocr 单次调用完成票种判断与字段抽取（每张图片 1 次 API 调用）；提示词与字段在 `src/invoice/recognize.ts` 的 `EXTRACT_PROMPT` 中调整。
+- **票种识别**：由通义千问 VL（默认 `qwen-vl-max`）单次调用完成票种判断与字段抽取（每张图片 1 次 API 调用）；提示词与字段在 `src/invoice/recognize.ts` 的 `EXTRACT_PROMPT` 中调整。

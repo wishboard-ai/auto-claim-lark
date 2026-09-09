@@ -408,7 +408,7 @@ export function makeMessageHandler(
       if (e instanceof QuotaExceededError) {
         await sendText(
           chatId,
-          '发票识别额度已用尽或账户欠费，暂时无法识别 😥\n请联系管理员在阿里云百炼（DashScope）控制台确认 qwen-vl-ocr 的额度 / 账户余额后再试。'
+          '发票识别额度已用尽或账户欠费，暂时无法识别 😥\n请联系管理员在阿里云百炼（DashScope）控制台确认识别模型（OCR_MODEL，默认 qwen-vl-max）的额度 / 账户余额后再试。'
         );
         return null;
       }
