@@ -22,21 +22,19 @@
     "approval"
   ],
   "license": "MIT",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.72.0",
+    "@larksuiteoapi/node-sdk": "^1.73.3",
     "dotenv": "^17.4.2",
     "heic-convert": "^2.1.0",
     "jsqr": "1.4.0",
     "jszip": "^3.10.1",
-    "pdf-to-img": "^6.3.0"
-  },
-  "overrides": {
-    "pdf-to-img": {
-      "pdfjs-dist": "^6.2.108"
-    }
+    "pdf-to-img": "^7.0.0"
   },
   "devDependencies": {
-    "@types/node": "^26.4.0",
+    "@types/node": "^26.4.1",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2"
   }
