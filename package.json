@@ -23,7 +23,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.72.0",
+    "@larksuiteoapi/node-sdk": "^1.73.3",
     "dotenv": "^17.4.2",
     "heic-convert": "^2.1.0",
     "jsqr": "1.4.0",
