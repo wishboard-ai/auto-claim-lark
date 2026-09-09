@@ -11,6 +11,9 @@ MONEY = r"([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{1,2}|[0-9]+\.[0-9]{1,2})"
 # 用允许字符间空白的模式匹配，避免漏识别导致回退到税前「金额」。
 VAT_TOTAL_LABEL = r"价\s*税\s*合\s*计"
 XIAOXIE = r"小\s*写"
+DAXIE = r"大\s*写"
+# 中文大写金额字符集（含常见异体）：用于抓取「价税合计（大写）」原文，交给上层解析并校正小写数字。
+CN_AMOUNT_CHARS = r"零〇壹贰貳弐叁參参叄肆伍陆陸柒捌玖拾佰仟万萬亿億元圆圓角分整正"
 
 TAXI_KW = ["出租车", "出租汽车", "TAXI", "taxi", "里程", "燃油附加", "叫车", "网约车"]
 TRAIN_KW = ["铁路电子", "火车票", "中国铁路", "12306", "始发站", "到达站"]
@@ -68,6 +71,32 @@ def _find_companies(full: str):
     return out
 
 
+def find_amount_in_words(text: str) -> Optional[str]:
+    """抓取「价税合计（大写）」的中文大写原文。
+
+    增值税发票只有价税合计带大写金额，语义唯一，可用于校正易取错列的小写数字。
+    OCR 常把标签拆成带空格的单字，故标签与取值之间允许少量空白/括号。
+    只回传原文（不在此解析成数字），由上层统一解析与勾稽。
+    """
+    pat = (
+        r"[（(]?\s*" + DAXIE + r"\s*[)）]?\s*[:：]?\s*"
+        r"([" + CN_AMOUNT_CHARS + r"][" + CN_AMOUNT_CHARS + r"\s]{1,30})"
+    )
+    m = re.search(pat, text)
+    if not m:
+        # 无「大写」标签时退而求其次：找一段以「元/圆」+「整/角/分」结尾的大写串
+        m = re.search(r"([" + CN_AMOUNT_CHARS + r"]{2,20}?[元圆圓][" + CN_AMOUNT_CHARS + r"]{0,6})", text)
+    if not m:
+        return None
+    words = re.sub(r"\s+", "", m.group(1))
+    # 必须含大写数字与「元/圆」，否则多为误匹配（如「合计」等标签残留）
+    if not re.search(r"[零〇壹贰貳弐叁參参叄肆伍陆陸柒捌玖]", words):
+        return None
+    if not re.search(r"[元圆圓]", words):
+        return None
+    return words
+
+
 def extract_vat(full: str, joined: str) -> Dict[str, Any]:
     amount = None
     m = re.search(VAT_TOTAL_LABEL + r"[\s\S]{0,20}?[（(]?\s*" + XIAOXIE + r"\s*[)）]?[\s\S]{0,6}?[¥￥]?\s*" + MONEY, full)
@@ -104,6 +133,7 @@ def extract_vat(full: str, joined: str) -> Dict[str, Any]:
         "buyerName": buyer,
         "invoiceNo": inv,
         "taxAmount": tax,
+        "amountInWords": find_amount_in_words(full),
         "summary": None,
     }
 

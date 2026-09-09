@@ -5,6 +5,7 @@ import { fetchWithTimeout } from '../util/http';
 import { isPdf, extractPdfText, hasUsableText, pdfFirstPageToImage } from './pdf';
 import { isHeic, heicToJpeg, isOfd, extractOfdText, isZip, extractArchiveFiles } from './formats';
 import { extractInvoiceQr, InvoiceQrData } from './qrcode';
+import { parseChineseAmount } from './chineseAmount';
 
 /** OCR 前预处理图片：HEIC/HEIF 转 JPEG（视觉模型/本地OCR无法直接读取）。其余原样返回。 */
 async function prepOcrImage(buf: Buffer): Promise<Buffer> {
@@ -84,6 +85,50 @@ function reconcileVatAmount(
 }
 
 /**
+ * 用票面「价税合计（大写）」校正数字金额（仅增值税发票）。
+ * 增值税发票只有价税合计带大写金额，且大写字形差异大、语义唯一，是最可信的含税总额锚点。
+ * 判定顺序：
+ *   1. 大写无法解析 → 不动；
+ *   2. 大写 ≈ 数字 amount → 相互印证，不动；
+ *   3. 大写 ≈ 不含税 + 税额 → 大写即价税合计，用它校正 amount；
+ *   4. 数字 amount ≈ 不含税 + 税额，但大写与两者都对不上 → 数字已被勾稽印证，保留数字并告警（疑为大写误识）；
+ *   5. 其余（数字缺失或与任何口径都对不上）→ 采用大写值。
+ * 返回两位小数字符串。
+ */
+function reconcileWithWords(
+  amount?: string,
+  netAmount?: string,
+  taxAmount?: string,
+  amountInWords?: string
+): string | undefined {
+  const w = parseChineseAmount(amountInWords);
+  if (w == null || w <= 0) return amount;
+  const near = (a: number, b: number) => Math.abs(a - b) <= 0.02;
+  const a = amount != null ? Number(amount) : NaN;
+  const net = netAmount != null ? Number(netAmount) : NaN;
+  const tax = taxAmount != null ? Number(taxAmount) : NaN;
+  const netPlusTax = Number.isFinite(net) && Number.isFinite(tax) ? net + tax : NaN;
+
+  if (Number.isFinite(a) && near(a, w)) return amount; // 数字与大写一致
+  if (Number.isFinite(netPlusTax) && near(w, netPlusTax)) {
+    logger.warn(
+      `大写金额校正：价税合计 ${amount ?? '-'} → ${w.toFixed(2)}（大写「${amountInWords}」，与不含税+税额一致）`
+    );
+    return w.toFixed(2);
+  }
+  if (Number.isFinite(a) && Number.isFinite(netPlusTax) && near(a, netPlusTax)) {
+    logger.warn(
+      `大写金额 ${w.toFixed(2)}（「${amountInWords}」）与数字勾稽结果 ${a.toFixed(2)}（不含税+税额）不一致，保留数字金额`
+    );
+    return amount;
+  }
+  logger.warn(
+    `大写金额校正：价税合计 ${amount ?? '-'} → ${w.toFixed(2)}（大写「${amountInWords}」，数字无法勾稽）`
+  );
+  return w.toFixed(2);
+}
+
+/**
  * 用发票二维码数据交叉校正 OCR 识别结果（仅增值税发票）。
  * - 发票号码/代码/开票日期：二维码是机器编码，比 OCR 读票面文字更可信，用于校正这三项。
  * - 金额：二维码第 5 段金额（全电发票实测为含税价税合计）。不预设含税/不含税，而是与 OCR 的
@@ -127,9 +172,21 @@ function applyQrToInvoice(invoice: RecognizedInvoice, qr: InvoiceQrData): Recogn
     const net = (out.raw.netAmount != null ? Number(out.raw.netAmount) : NaN); // OCR 不含税
     const tax = out.taxAmount != null ? Number(out.taxAmount) : NaN; // OCR 税额
     const netPlusTax = Number.isFinite(net) && Number.isFinite(tax) ? net + tax : NaN;
+    // 票面「价税合计（大写）」：语义唯一、字形不易混，可信度高于二维码金额（后者含税口径按票种/年代而异）。
+    const wordsAmt = parseChineseAmount(out.raw.amountInWords) ?? NaN;
 
     if (Number.isFinite(ocrGross) && near(ocrGross, qrAmt)) {
       // 二维码金额与 OCR 价税合计一致：相互印证，无需改。
+    } else if (
+      Number.isFinite(wordsAmt) &&
+      Number.isFinite(ocrGross) &&
+      near(ocrGross, wordsAmt) &&
+      !near(qrAmt, wordsAmt)
+    ) {
+      // 当前 amount 已被票面大写金额印证：二维码与之不符时不覆盖，仅记录备查。
+      logger.info(
+        `二维码金额 ${qrAmt.toFixed(2)} 与票面大写金额 ${wordsAmt.toFixed(2)} 不一致，以大写金额为准，不改金额`
+      );
     } else if (Number.isFinite(netPlusTax) && near(qrAmt, netPlusTax)) {
       // 二维码金额 = 不含税 + 税额 = 价税合计。若 OCR 的 amount 与之不符则以二维码为准校正。
       const gross = qrAmt.toFixed(2);
@@ -288,8 +345,8 @@ const TYPE_LABELS: Record<Exclude<InvoiceType, 'unknown'>, string> = {
   taxi: '出租车票',
 };
 
-/** 统一映射：结构化对象 -> RecognizedInvoice（两种 provider 共用）。 */
-function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
+/** 统一映射：结构化对象 -> RecognizedInvoice（两种 provider 共用；导出以便单测归一化逻辑）。 */
+export function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
   const rawType = String(parsed.type || '').toLowerCase();
   const type: InvoiceType =
     rawType === 'vat' || rawType === 'train' || rawType === 'taxi' ? (rawType as InvoiceType) : 'unknown';
@@ -305,8 +362,10 @@ function buildFromParsed(parsed: Record<string, unknown>): RecognizedInvoice {
   let amount = normAmount(parsed.amount);
   // 价税合计纠偏（仅增值税发票）：模型偶尔把「不含税金额」误当作 amount。
   // 若有不含税金额与税额，且 net+tax 明显大于当前 amount（≈等于 net），则改用含税合计，避免少报。
+  // 之后再用票面「价税合计（大写）」做最终校正——大写只存在于价税合计，语义唯一、字形不易混。
   if (type === 'vat') {
     amount = reconcileVatAmount(amount, netAmount, taxAmount);
+    amount = reconcileWithWords(amount, netAmount, taxAmount, strOrUndef(parsed.amountInWords));
   }
   const invoice: RecognizedInvoice = {
     type,
@@ -352,8 +411,12 @@ const FIELD_SPEC =
   '严禁取「金额」列或不含税的「合计」小计（那是税前金额，通常比价税合计小）；\n' +
   '  · 火车票/出租车/网约车：取实付总额（含税）；\n' +
   '  · 若同时出现「金额/合计（不含税）」与「价税合计（含税）」两个数，一律取较大的价税合计；\n' +
+  '  · 若票面有「价税合计（大写）」，请以大写金额为准核对小写数字（大写只写价税合计），两者不一致时以大写为准；\n' +
   '- netAmount: 不含税金额（元，仅增值税发票，即「合计金额（不含税）」/「金额」列小计，只要数字，无则留空）。' +
   '注意 netAmount 与 amount 的区别：amount 是含税的价税合计，netAmount 是税前小计，两者一般不相等（amount = netAmount + 合计税额）；\n' +
+  '- amountInWords: 「价税合计（大写）」的中文大写原文（仅增值税发票，如「壹仟贰佰叁拾肆元伍角陆分」「贰佰元整」）。' +
+  '**必须逐字照抄票面大写字符**，不要翻译成数字、不要改写、不要补「整」；票面没有大写金额则留空。' +
+  '注意大写金额只对应价税合计（含税总额），不含税金额与税额没有大写；\n' +
   '- date: 开票/乘车日期，格式 YYYY-MM-DD；\n' +
   '- sellerName: 销售方/商家/承运方名称；\n' +
   '- buyerName: 购买方名称（无则留空）；\n' +
@@ -366,7 +429,7 @@ const FIELD_SPEC =
   '严禁编造{SRC}中不存在的信息，找不到的字段填空字符串。\n' +
   '返回示例：{"type":"train","amount":"553.5","date":"2024-01-15","sellerName":"中国铁路",' +
   '"buyerName":"","invoiceNo":"E123456789","invoiceCode":"","checkCode":"","taxAmount":"","netAmount":"",' +
-  '"summary":"北京南→上海虹桥 G1 二等座"}';
+  '"amountInWords":"","summary":"北京南→上海虹桥 G1 二等座"}';
 
 const EXTRACT_PROMPT =
   '你是发票识别助手。请识别图片中的票据类型并抽取关键字段，只返回一个严格的 JSON 对象，' +
