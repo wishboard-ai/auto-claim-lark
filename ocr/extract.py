@@ -48,27 +48,110 @@ def largest_amount(text: str) -> Optional[str]:
     return f"{max(vals):.2f}" if vals else None
 
 
-# 企业名后缀白名单（避免用裸「社/部」等造成误匹配，如「统一社会信用代码」）
-_COMPANY_RE = re.compile(
-    r"[\u4e00-\u9fa5（）()·]{2,}?"
-    r"(?:有限责任公司|股份有限公司|有限公司|分公司|公司|集团|厂|商行|商店|商贸|"
-    r"超市|酒店|饭店|宾馆|旅行社|事务所|合作社|研究院|研究所|学校|医院|银行股份|中心)"
+# 企业名抽取（避免用裸「社/部」等造成误匹配，如「统一社会信用代码」）。
+# 分两类后缀：
+# - _COMPANY_TAIL：以「公司」结尾（最常见）。前缀用 (?!公司) 逐字前进，保证匹配到「公司」即停：
+#   既避免非贪婪量词把「测试商贸有限公司」截成「测试商贸」并留下垃圾「有限公司」，
+#   也避免贪婪量词把同一行相邻的两个公司名粘成一个。
+# - _OTHER_TAIL：厂/集团/医院/中心 等结尾，要求其后不再紧跟汉字（否则多为名称中间的字），
+#   仅在该行找不到「公司」名时才使用。
+_COMPANY_TAIL = r"(?:有限责任公司|股份有限公司|有限公司|分公司|公司)"
+_OTHER_TAIL = (
+    r"(?:集团|厂|商行|商店|商贸|超市|酒店|饭店|宾馆|旅行社|事务所|合作社|"
+    r"研究院|研究所|学校|医院|银行股份|中心)"
 )
+_NAME_CHAR = r"(?:(?!公司)[\u4e00-\u9fa5（）()·])"
+_COMPANY_RE = re.compile(_NAME_CHAR + r"{1,30}" + _COMPANY_TAIL)
+_OTHER_RE = re.compile(_NAME_CHAR + r"{2,30}" + _OTHER_TAIL + r"(?![\u4e00-\u9fa5])")
 # 命中这些词的候选一律丢弃（多为标签/字段名而非公司名）
 _COMPANY_BAD = ("代码", "信用", "识别", "账号", "开户", "地址", "电话", "税务", "社会")
+# 名称前常被 OCR 粘上的标签词，逐层剥离（如「销售方名称测试商贸有限公司」）
+_NAME_LABELS = (
+    "销售方信息", "购买方信息", "销售方名称", "购买方名称", "销售方", "购买方",
+    "受票方", "开票方", "名称", "信息", "开票人", "收款人", "复核人", "复核", "备注",
+)
+# 「销售方 / 购买方」标签（OCR 常把字拆开，允许字间空白）
+_SELLER_LABEL = r"销\s*售\s*方|销\s*方"
+_BUYER_LABEL = r"购\s*买\s*方|购\s*方|受\s*票\s*方"
+
+
+def _trim_name_label(name: str) -> str:
+    """剥离名称前粘连的标签词与标点。"""
+    prev = None
+    while prev != name:
+        prev = name
+        name = name.lstrip("：: 　·（()）")
+        for label in _NAME_LABELS:
+            if name.startswith(label):
+                name = name[len(label):]
+                break
+    return name.strip()
+
+
+def _company_candidates(text: str):
+    """逐行抽取公司名候选：优先「…公司」，该行没有时再试厂/集团/中心等后缀。"""
+    out = []
+    for line in text.split("\n"):
+        found = _COMPANY_RE.findall(line) or _OTHER_RE.findall(line)
+        for c in found:
+            c = _trim_name_label(c)
+            if len(c) < 4:  # 「有限公司」「某公司」这类残片不足以作为名称
+                continue
+            if any(b in c for b in _COMPANY_BAD):
+                continue
+            if c not in out:
+                out.append(c)
+    return out
+
+
+def _company_near_label(full: str, label: str) -> Optional[str]:
+    """取标签（销售方/购买方）之后窗口内的第一个公司名。找不到返回 None。"""
+    for m in re.finditer(label, full):
+        window = full[m.end(): m.end() + 80]
+        cands = _company_candidates(window)
+        if cands:
+            return cands[0]
+    return None
 
 
 def _find_companies(full: str):
-    out = []
-    for c in _COMPANY_RE.findall(full):
-        c = c.strip()
-        if len(c) < 3:
-            continue
-        if any(b in c for b in _COMPANY_BAD):
-            continue
-        if c not in out:
-            out.append(c)
-    return out
+    return _company_candidates(full)
+
+
+def _line_index(text: str, pos: int) -> int:
+    return text.count("\n", 0, pos)
+
+
+def _resolve_parties(full: str):
+    """判定 (销售方, 购买方)。
+
+    版式差异大，优先用标签定位，其次按位置启发：
+    1. 两个标签在同一行（「购买方信息 | 销售方信息」并排表头）：其后的公司名按出现顺序
+       与标签顺序一一对应（左购买方、右销售方）；
+    2. 标签分行出现：各取标签之后窗口内的第一个公司名；
+    3. 无标签：票面购买方在前、销售方在后。
+    """
+    companies = _company_candidates(full)
+    ms = re.search(_SELLER_LABEL, full)
+    mb = re.search(_BUYER_LABEL, full)
+
+    if ms and mb and _line_index(full, ms.start()) == _line_index(full, mb.start()):
+        tail = full[max(ms.end(), mb.end()):]
+        cands = _company_candidates(tail)
+        if len(cands) >= 2:
+            first, second = cands[0], cands[1]
+            return (second, first) if mb.start() < ms.start() else (first, second)
+
+    seller = _company_near_label(full, _SELLER_LABEL) if ms else None
+    buyer = _company_near_label(full, _BUYER_LABEL) if mb else None
+    if seller and buyer and seller == buyer:
+        # 同一个名字被两个标签都命中（窗口重叠/标签漏识）：保留销售方，购买方另取。
+        buyer = next((c for c in companies if c != seller), None)
+    if not seller:
+        seller = next((c for c in reversed(companies) if c != buyer), None)
+    if not buyer:
+        buyer = next((c for c in companies if c != seller), None)
+    return seller, buyer
 
 
 def find_amount_in_words(text: str) -> Optional[str]:
@@ -121,9 +204,7 @@ def extract_vat(full: str, joined: str) -> Dict[str, Any]:
         if mi:
             inv = mi.group(1)
 
-    companies = _find_companies(full)
-    seller = companies[-1] if companies else None
-    buyer = companies[0] if len(companies) >= 2 else None
+    seller, buyer = _resolve_parties(full)
 
     return {
         "type": "vat",

@@ -7,6 +7,8 @@ Node 主服务通过 `OCR_PROVIDER=paddle` 以本地 HTTP 调用它。
 
 - `ocr_service.py`：FastAPI 服务。`POST /recognize` 接收图片二进制 → PaddleOCR 识别文字 → `extract.structure` 规则抽取 → 返回统一 JSON。
 - `extract.py`：纯规则的票种分类与字段抽取（仅依赖标准库，便于单测/调参）。
+- `test_extract.py`：`extract.py` 的单测（标准库 unittest，无需装 paddle）：
+  `python -m unittest discover -s ocr -p "test_*.py"`
 - `requirements.txt` / `start-ocr.sh`：依赖与一键启动。
 
 返回 JSON 字段与 Node 端 `RecognizedInvoice` 对齐：
