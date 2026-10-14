@@ -30,7 +30,7 @@
     "dotenv": "^17.4.2",
     "heic-convert": "^2.1.0",
     "jsqr": "1.4.0",
-    "jszip": "^3.10.1",
+    "jszip": "^3.10.2",
     "pdf-to-img": "^7.0.0"
   },
   "devDependencies": {
