@@ -1,5 +1,6 @@
 import { RecognizedInvoice } from '../types';
 import { LoanReference } from '../writeoff/loans';
+import { buildOperationHint } from './actions';
 
 type ClaimMode = 'loan_writeoff' | 'expense';
 
@@ -41,16 +42,18 @@ export function writeOffCard(
   });
 }
 
-export function loanSelectionCard(loans: Array<{ serialNumber: string; approvedDate: string; applicantOpenId?: string; amount?: string; remainingAmount?: string; reason?: string }>, showApplicant = false): string {
+export function loanSelectionCard(loans: Array<{ serialNumber: string; approvedDate: string; applicantOpenId?: string; amount?: string; remainingAmount?: string; reason?: string }>, showApplicant = false, hint?: string): string {
   const lines = loans.map((loan, i) => {
     const applicant = showApplicant && loan.applicantOpenId ? `　申请人 <at id=${loan.applicantOpenId}></at>` : '';
     return `${i + 1}. **${loan.serialNumber}**　借款 ¥${loan.amount ?? '-'}　剩余 ¥${loan.remainingAmount ?? loan.amount ?? '-'}　${loan.approvedDate}${applicant}\n   ${loan.reason ?? ''}`;
   }).join('\n');
-  return JSON.stringify({ config: { wide_screen_mode: true }, header: { template: 'blue', title: { tag: 'plain_text', content: '请选择要核销的借款' } }, elements: [{ tag: 'div', text: { tag: 'lark_md', content: lines } }, { tag: 'hr' }, { tag: 'div', text: { tag: 'lark_md', content: '回复序号（例如 **1**）选择付款申请。日期为该付款申请审批真正通过的日期。' } }] });
+  const operationHint = hint ?? `可用操作：\n回复 1-${loans.length} 之间的序号选择付款申请。\n继续上传发票；回复「附件」上传辅助材料，材料模式中回复「发票」切回。\n回复「取消」放弃本次办理。`;
+  return JSON.stringify({ config: { wide_screen_mode: true }, header: { template: 'blue', title: { tag: 'plain_text', content: '请选择要核销的借款' } }, elements: [{ tag: 'div', text: { tag: 'lark_md', content: lines } }, { tag: 'hr' }, { tag: 'div', text: { tag: 'lark_md', content: `日期为该付款申请审批真正通过的日期。\n\n${operationHint}` } }] });
 }
 
-export function modeSelectionCard(): string {
-  return JSON.stringify({ config: { wide_screen_mode: true }, header: { template: 'blue', title: { tag: 'plain_text', content: '请选择办理类型' } }, elements: [{ tag: 'div', text: { tag: 'lark_md', content: '回复 **借款核销**：关联已通过的付款申请，可分批核销。\n\n回复 **费用报销**：直接发起费用报销审批。' } }] });
+export function modeSelectionCard(loanEnabled = true): string {
+  const description = (loanEnabled ? '借款核销：关联已通过的付款申请，可分批核销。\n\n' : '') + '费用报销：发起费用报销审批。';
+  return JSON.stringify({ config: { wide_screen_mode: true }, header: { template: 'blue', title: { tag: 'plain_text', content: '请选择办理类型' } }, elements: [{ tag: 'div', text: { tag: 'lark_md', content: `${description}\n\n${buildOperationHint(undefined, { loanEnabled })}` } }] });
 }
 
 function totalAmount(invoices: RecognizedInvoice[]): string {
@@ -63,7 +66,7 @@ function briefLine(inv: RecognizedInvoice, idx: number): string {
 }
 
 /** 发票加入购物车后的卡片（含累计） */
-export function addedCard(invoices: RecognizedInvoice[], mode: ClaimMode): string {
+export function addedCard(invoices: RecognizedInvoice[], mode: ClaimMode, hint?: string): string {
   const isLoan = mode === 'loan_writeoff';
   const list = invoices.map((v, i) => briefLine(v, i + 1)).join('\n');
   return JSON.stringify({
@@ -75,9 +78,7 @@ export function addedCard(invoices: RecognizedInvoice[], mode: ClaimMode): strin
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: list } },
       { tag: 'hr' },
-      { tag: 'div', text: { tag: 'lark_md', content: isLoan
-        ? '继续发送发票可累加；回复本次「核销事由」后，我会查询并关联已通过的付款申请。'
-        : '继续发送发票可累加；回复本次「报销事由」后，我会生成费用报销预览。' } },
+      { tag: 'div', text: { tag: 'lark_md', content: hint ?? buildOperationHint({ items: invoices.map((invoice) => ({ invoice })), attachments: [], createdAt: 0, mode }) } },
     ],
   });
 }
@@ -88,12 +89,20 @@ export function successCard(
   link: string | undefined,
   title: string,
   categoryLabel: string | undefined,
-  mode: ClaimMode
+  mode: ClaimMode,
+  loanEnabled = true,
+  claimAmount?: number
 ): string {
   const list = invoices.map((v, i) => briefLine(v, i + 1)).join('\n');
-  const head = categoryLabel
-    ? `**${title}**\n**报销类别**：${categoryLabel}\n共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}\n\n${list}`
-    : `**${title}**\n共 ${invoices.length} 张，合计 ¥${totalAmount(invoices)}\n\n${list}`;
+  const invoiceTotal = Number(totalAmount(invoices));
+  const actualAmount = claimAmount ?? invoiceTotal;
+  const rows = [`**${title}**`];
+  if (categoryLabel) rows.push(`**报销类别**：${categoryLabel}`);
+  rows.push(`共 ${invoices.length} 张，发票合计 ¥${invoiceTotal.toFixed(2)}`);
+  if (mode === 'expense') {
+    rows.push(`**实际报销金额**：¥${actualAmount.toFixed(2)}${actualAmount < invoiceTotal ? '（少于发票合计）' : ''}`);
+  }
+  const head = `${rows.join('\n')}\n\n${list}`;
   const elements: Array<Record<string, unknown>> = [
     {
       tag: 'div',
@@ -109,6 +118,7 @@ export function successCard(
       actions: [{ tag: 'button', text: { tag: 'plain_text', content: '查看审批' }, type: 'primary', url: link }],
     });
   }
+  elements.push({ tag: 'div', text: { tag: 'lark_md', content: `办理下一笔，请回复${loanEnabled ? '「费用报销」或「借款核销」' : '「费用报销」'}。` } });
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: { template: 'green', title: { tag: 'plain_text', content: mode === 'loan_writeoff' ? '借款核销审批已提交' : '费用报销审批已提交' } },
@@ -129,7 +139,8 @@ export function previewCard(
   loan: LoanReference | undefined,
   mode: ClaimMode,
   attachmentCount = 0,
-  claimAmount?: number
+  claimAmount?: number,
+  hint?: string
 ): string {
   const list = invoices.map((v, i) => briefLine(v, i + 1)).join('\n');
   const invoiceTotal = Number(totalAmount(invoices));
@@ -151,18 +162,18 @@ export function previewCard(
   if (attachmentCount > 0) rows.push(`**附加材料**：${attachmentCount} 个（仅附件，不计入金额）`);
   rows.push('');
   rows.push(list);
-  const hint =
-    '回复「**确认**」提交审批；回复「**取消**」放弃。\n' +
-    (categoryNames.length ? `如需改类别，回复其中一个名称：${categoryNames.join(' / ')}。\n` : '') +
-    `如需只报部分金额，回复「**金额 数字**」（不超过 ¥${invoiceTotal.toFixed(2)}）。\n` +
-    '如需改事由，直接回复新的事由文字，我会重新整理并再次预览。';
+  const operationHint = hint ?? buildOperationHint({
+    items: invoices.map((invoice) => ({ invoice })), attachments: [], createdAt: 0, mode,
+    draft: { reason: reason ?? '', title, category: categoryLabel },
+  });
+  const categoryHint = categoryNames.length ? `\n可选类别名称：${categoryNames.join(' / ')}。` : '';
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: { template: 'orange', title: { tag: 'plain_text', content: '请核对，回复「确认」后提交' } },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: rows.join('\n') } },
       { tag: 'hr' },
-      { tag: 'div', text: { tag: 'lark_md', content: hint } },
+      { tag: 'div', text: { tag: 'lark_md', content: operationHint + categoryHint } },
     ],
   });
 }

@@ -15,6 +15,8 @@ import { uploadApprovalFile } from '../approval/uploadImage';
 import { LoanWriteOffLedger } from '../writeoff/ledger';
 import { isLoanApprovalAdmin, listOutstandingLoans, LoanReference } from '../writeoff/loans';
 import { InvoiceDuplicateError, InvoiceUsageLedger, invoiceFingerprint } from '../invoice/dedup';
+import { extractMessageMedia } from './messageMedia';
+import { buildOperationHint } from '../reply/actions';
 
 const CONFIRM_WORDS = ['确认', '提交', 'confirm', 'ok', 'y', 'yes', '是', '好'];
 const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
@@ -22,8 +24,6 @@ const CANCEL_WORDS = ['取消', '放弃', 'cancel', 'n', 'no', '否'];
 const ATTACH_ON_WORDS = ['附件', '补充材料', '辅助材料', '材料', '附材料', '加附件', '上传附件'];
 const ATTACH_OFF_WORDS = ['发票', '继续发票', '继续发发票', '发发票'];
 
-const HELP_TEXT =
-  '你好，我是费用助手 🧾\n请先选择办理类型：回复「借款核销」或「费用报销」。';
 const MODE_WORDS: Record<string, ClaimMode> = { '借款核销': 'loan_writeoff', '核销': 'loan_writeoff', '费用报销': 'expense', '报销': 'expense' };
 
 export function makeMessageHandler(
@@ -43,9 +43,13 @@ export function makeMessageHandler(
     return false;
   }
 
-  // 进入会话欢迎语节流
-  const welcomed = new Map<string, number>();
-  const WELCOME_TTL_MS = 30 * 60 * 1000;
+  // 展示用路由信息：让文本提示读取该聊天当前用户的既有会话，不决定办理流程。
+  const chatUsers = new Map<string, string>();
+  const hintOptions = { directExpense: cfg.submitMode === 'direct', loanEnabled: cfg.writeOff.enabled && !!ledger };
+  function operationHint(chatId: string): string {
+    const openId = chatUsers.get(chatId);
+    return buildOperationHint(openId ? getPending(openId) : undefined, hintOptions);
+  }
   // 防止两个并发提交在飞书创建接口等待期间绕过台账查重。
   const submittingLoanCodes = new Set<string>();
 
@@ -85,7 +89,7 @@ export function makeMessageHandler(
   async function sendText(chatId: string, text: string): Promise<void> {
     await client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, content: JSON.stringify({ text }), msg_type: 'text' },
+      data: { receive_id: chatId, content: JSON.stringify({ text: `${text}\n\n${operationHint(chatId)}` }), msg_type: 'text' },
     });
   }
 
@@ -116,7 +120,7 @@ export function makeMessageHandler(
     const built = buildApprovalForm(invoices, draftToOverrides(draft), [], [], loan, claimAmount);
     const title = mode === 'expense' ? built.title.replace(/^借款核销/, '费用报销') : built.title;
     const categoryLabel = built.categoryLabel;
-    await sendCard(chatId, previewCard(invoices, title, categoryLabel, draft.reason, getCategoryOptionNames(mode), loan, mode, attachmentCount, claimAmount));
+    await sendCard(chatId, previewCard(invoices, title, categoryLabel, draft.reason, getCategoryOptionNames(mode), loan, mode, attachmentCount, claimAmount, operationHint(chatId)));
   }
 
   /** 用草稿实际创建审批：上传图片 → 构建表单 → 创建 → 回复结果卡片。 */
@@ -248,7 +252,7 @@ export function makeMessageHandler(
         }
       }
       try {
-        await sendCard(chatId, successCard(invoices, created.instanceLink, title, categoryLabel, mode));
+        await sendCard(chatId, successCard(invoices, created.instanceLink, title, categoryLabel, mode, hintOptions.loanEnabled, claimAmount));
       } catch (e) {
         logger.warn('审批已创建，但发送成功卡片失败：', (e as Error).message);
         await sendText(chatId, `审批已创建（实例 ${created.instanceCode}），但结果卡片发送失败，请前往飞书审批中查看。`).catch(() => undefined);
@@ -290,7 +294,7 @@ export function makeMessageHandler(
     logger.info(`图片已下载：${buffer.length} 字节`);
     if (openId && getPending(openId)?.collectingAttachments) {
       const c = addAttachment(openId, { imageBuffer: buffer, imageExt: imgExt(buffer) });
-      await sendText(chatId, `已附加材料（图片），当前材料 ${c?.attachments.length ?? 1} 个。继续发材料，或回复「发票」继续发发票，或回复事由提交。`);
+      await sendText(chatId, `已附加材料（图片），当前材料 ${c?.attachments.length ?? 1} 个。`);
       return;
     }
     await recognizeAndCollect(chatId, openId, buffer);
@@ -327,7 +331,7 @@ export function makeMessageHandler(
       const c = addAttachment(openId, att);
       await sendText(
         chatId,
-        `已附加材料（${isImg ? '图片' : '文件'}${fileName ? '：' + fileName : ''}），当前材料 ${c?.attachments.length ?? 1} 个。继续发材料，或回复「发票」继续发发票，或回复事由提交。`
+        `已附加材料（${isImg ? '图片' : '文件'}${fileName ? '：' + fileName : ''}），当前材料 ${c?.attachments.length ?? 1} 个。`
       );
       return;
     }
@@ -468,10 +472,10 @@ export function makeMessageHandler(
     const mode = pending?.mode || 'expense';
     if (cfg.submitMode === 'direct' && mode === 'expense') {
       const draft = await buildDraft([item], '', mode);
-      await submitDraft(chatId, openId, [item], draft, undefined, mode);
+      await submitDraft(chatId, openId, [item], draft, undefined, mode, pending?.attachments);
     } else {
       const claim = addItem(openId, item);
-      await sendCard(chatId, addedCard(claim.items.map((i) => i.invoice), mode));
+      await sendCard(chatId, addedCard(claim.items.map((i) => i.invoice), mode, operationHint(chatId)));
     }
   }
 
@@ -485,7 +489,7 @@ export function makeMessageHandler(
 
     if (openId && CANCEL_WORDS.includes(lower)) {
       clearPending(openId);
-      await sendText(chatId, '已取消本次报销。');
+      await sendText(chatId, '已取消本次办理。');
       return;
     }
     let pending = openId ? getPending(openId) : undefined;
@@ -496,26 +500,26 @@ export function makeMessageHandler(
         return;
       }
       pending = startSession(openId, chosenMode);
-      await sendText(chatId, chosenMode === 'loan_writeoff' ? '已选择「借款核销」。请发送本次实际消费的发票，发送完成后回复核销事由。（如需附支付截图/行程单等材料，回复「附件」）' : '已选择「费用报销」。请发送报销发票，发送完成后回复报销事由。（如需附支付截图/行程单等材料，回复「附件」）');
+      await sendText(chatId, `已选择「${chosenMode === 'loan_writeoff' ? '借款核销' : '费用报销'}」。`);
       return;
     }
     if (!openId || !pending) {
-      await sendCard(chatId, modeSelectionCard());
+      await sendCard(chatId, modeSelectionCard(hintOptions.loanEnabled));
       return;
     }
     // 附件模式开关（支付截图/行程单等只附加、不识别/查重）
     if (ATTACH_ON_WORDS.includes(raw)) {
       setCollecting(openId, true);
-      await sendText(chatId, '已进入附件模式：请发送支付截图、行程单等辅助材料（图片或文件），只作为附件、不做识别/查重。发完回复「发票」继续发发票，或直接回复事由提交。');
+      await sendText(chatId, '已进入附件模式：图片或文件只作为辅助材料，不做识别/查重。');
       return;
     }
     if (ATTACH_OFF_WORDS.includes(raw) && pending.collectingAttachments) {
       setCollecting(openId, false);
-      await sendText(chatId, '已切回发票模式：请继续发送发票。');
+      await sendText(chatId, '已切回发票模式。');
       return;
     }
     if (pending.items.length === 0) {
-      await sendText(chatId, `当前已选择「${pending.mode === 'loan_writeoff' ? '借款核销' : '费用报销'}」，请发送发票图片/PDF/OFD。（如需附支付截图、行程单等材料，回复「附件」）`);
+      await sendText(chatId, `当前已选择「${pending.mode === 'loan_writeoff' ? '借款核销' : '费用报销'}」，还没有加入发票。`);
       return;
     }
 
@@ -596,7 +600,7 @@ export function makeMessageHandler(
       }
       if (loans.length > 1) {
         setLoanSelection(openId, loans, raw);
-        await sendCard(chatId, loanSelectionCard(loans, isAdmin));
+        await sendCard(chatId, loanSelectionCard(loans, isAdmin, operationHint(chatId)));
         return;
       }
       selectLoan(openId, loans[0]);
@@ -611,18 +615,8 @@ export function makeMessageHandler(
     await showPreview(chatId, pending.items, draft, pending.mode, undefined, pending.attachments.length, pending.claimAmount);
   }
 
-  async function onChatEntered(event: any): Promise<void> {
-    const chatId: string | undefined = event?.chat_id;
-    if (!chatId) return;
-    const now = Date.now();
-    const last = welcomed.get(chatId);
-    if (last && now - last < WELCOME_TTL_MS) return;
-    welcomed.set(chatId, now);
-    try {
-      await sendCard(chatId, modeSelectionCard());
-    } catch (e) {
-      logger.warn('发送欢迎语失败：', (e as Error).message);
-    }
+  async function onChatEntered(_event: any): Promise<void> {
+    // 保留事件接收以兼容已订阅的飞书事件；打开/切回聊天不发送消息、不改会话。
   }
 
   async function onMessage(event: any): Promise<void> {
@@ -632,6 +626,7 @@ export function makeMessageHandler(
     const messageId: string | undefined = message?.message_id;
     const msgType: string | undefined = message?.message_type;
     if (!chatId || !messageId) return;
+    if (openId) chatUsers.set(chatId, openId);
     if (seenBefore(messageId)) {
       logger.debug(`忽略重复推送的消息 ${messageId}`);
       return;
@@ -642,25 +637,46 @@ export function makeMessageHandler(
     // 多张发票严格按发送顺序累加。
     const key = openId || chatId;
     // 发票类消息（非附件模式）识别较慢：先即时回执「已收到 + 预计处理时间(含排队)」。
-    const isMedia = msgType === 'image' || msgType === 'file';
+    let media: ReturnType<typeof extractMessageMedia> = [];
+    let mediaParseError: unknown;
+    try {
+      media = extractMessageMedia(msgType || '', message.content);
+    } catch (e) {
+      mediaParseError = e;
+    }
+    const isMedia = media.length > 0;
     const ackSession = openId ? getPending(openId) : undefined;
     const trackRecognition = isMedia && !!ackSession && !ackSession.collectingAttachments;
     if (trackRecognition) {
       const ahead = pendingCounts.get(key) ?? 0;
-      pendingCounts.set(key, ahead + 1);
-      const etaText = fmtEta((ahead + 1) * avgRecognizeMs);
+      pendingCounts.set(key, ahead + media.length);
+      const etaText = fmtEta((ahead + media.length) * avgRecognizeMs);
       const queueText = ahead > 0 ? `（前面还有 ${ahead} 个在排队）` : '';
-      void sendText(chatId, `🧾 已收到，正在识别处理…预计 ${etaText}${queueText}，完成后回复结果。`).catch(() => undefined);
+      void sendText(chatId, `🧾 已收到${media.length > 1 ? ` ${media.length} 个文件/图片` : ''}，正在识别处理…预计 ${etaText}${queueText}，完成后回复结果。`).catch(() => undefined);
     }
     enqueue(key, async () => {
       try {
+        if (mediaParseError) throw mediaParseError;
         const session = openId ? getPending(openId) : undefined;
-        if ((msgType === 'image' || msgType === 'file') && !session) {
-          await sendCard(chatId, modeSelectionCard());
-        } else if (msgType === 'image') {
-          await handleImage(chatId, openId, messageId, message.content);
-        } else if (msgType === 'file') {
-          await handleFile(chatId, openId, messageId, message.content);
+        if (isMedia && !session) {
+          await sendCard(chatId, modeSelectionCard(hintOptions.loanEnabled));
+        } else if (isMedia) {
+          // 确定性数据管道：每个附件沿用单文件处理，不改变 LLM 的内容判断。
+          for (const part of media) {
+            try {
+              if (part.type === 'image') {
+                await handleImage(chatId, openId, messageId, JSON.stringify({ image_key: part.imageKey }));
+              } else {
+                await handleFile(chatId, openId, messageId, JSON.stringify({ file_key: part.fileKey, file_name: part.fileName }));
+              }
+            } catch (e) {
+              // 附件彼此独立：报告这一份的实际错误，后面的附件仍进入同一数据管道。
+              logger.error('处理消息附件失败', e);
+              await sendText(chatId, `处理${part.type === 'file' && part.fileName ? `「${part.fileName}」` : '图片'}失败：${(e as Error).message}`).catch((replyError) => {
+                logger.warn('发送附件失败提示失败：', (replyError as Error).message);
+              });
+            }
+          }
         } else if (msgType === 'text') {
           await handleText(chatId, openId, message.content);
         } else {
@@ -678,7 +694,7 @@ export function makeMessageHandler(
         }
       } finally {
         if (trackRecognition) {
-          const n = (pendingCounts.get(key) ?? 1) - 1;
+          const n = (pendingCounts.get(key) ?? media.length) - media.length;
           if (n <= 0) pendingCounts.delete(key);
           else pendingCounts.set(key, n);
         }
